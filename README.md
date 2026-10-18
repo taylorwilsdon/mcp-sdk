@@ -113,9 +113,9 @@ A cached `tools/list` of 50 tools costs the same as `server/discover`.
 
 ## Limitations
 
-- No HTTP/2 (h2c) transport. ocaml-h2 0.13 neither lets a client reset a single stream
-  nor tells a server that its peer reset one, so cancellation could not work per request.
-  It will be added once ocaml-h2 supports both.
+- Streamable HTTP is served over HTTP/1.1 only, as the official SDKs do. Terminate TLS
+  and HTTP/2 at a reverse proxy; one that closes the upstream request when its client goes
+  away (nginx's default) carries cancellation through.
 - The official `@modelcontextprotocol/conformance` suite (0.1.16) still speaks 2025-11-25
   only, so it cannot drive a modern-only server yet.
 - Tool arguments are validated by their `Schema` decoder. There is no general JSON Schema

@@ -1,5 +1,5 @@
-(* Streamable HTTP (2026-07-28) independent of the HTTP version. The
-   HTTP/1.1 adapter presents each request as an [exchange]. *)
+(* Streamable HTTP (2026-07-28) request handling. [Http1] presents each
+   httpun request as an [exchange], which keeps this module free of httpun. *)
 
 open Mcp
 
