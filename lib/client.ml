@@ -18,6 +18,7 @@ type t = {
   on_input : input_handler;
   next_id : int Atomic.t;
   cache : (string, cached) Hashtbl.t;
+  generations : (string, int) Hashtbl.t;
   mutable tools : Proto.Tool_info.t list;
 }
 
@@ -29,7 +30,15 @@ let connect ?info ?(capabilities = Proto.Client_caps.none) ?(on_input = fun _ _ 
     :: Option.fold info ~none:[] ~some:(fun i ->
         [ (Proto.key_client_info, encode Proto.Implementation.codec i) ])
   in
-  { transport; meta; on_input; next_id = Atomic.make 1; cache = Hashtbl.create 8; tools = [] }
+  {
+    transport;
+    meta;
+    on_input;
+    next_id = Atomic.make 1;
+    cache = Hashtbl.create 8;
+    generations = Hashtbl.create 8;
+    tools = [];
+  }
 
 let pp_error ppf = function
   | Remote e -> Error.pp ppf e
@@ -121,11 +130,12 @@ let headers t method_ params =
 
 (* Responses *)
 
-type response = { result : Json.t option; error : Error.t option }
+type response = { jsonrpc : string; id : Id.t; result : Json.t option; error : Error.t option }
 
 let response_codec =
-  O.map (fun result error -> { result; error })
-  |> O.opt_mem "result" Jsont.json |> O.opt_mem "error" Error.codec |> O.finish
+  O.map (fun jsonrpc id result error -> { jsonrpc; id; result; error })
+  |> O.mem "jsonrpc" Jsont.string |> O.mem "id" Id.codec |> O.opt_mem "result" Jsont.json
+  |> O.opt_mem "error" Error.codec |> O.finish
 
 let meta t ~progress id =
   Json.obj (if progress then ("progressToken", Id.to_json id) :: t.meta else t.meta)
@@ -152,9 +162,11 @@ let send t ?on_note method_ params =
   | raw -> (
       match Json.decode response_codec raw with
       | Error msg -> Error (Local ("Malformed response: " ^ msg))
-      | Ok { error = Some e; _ } -> Error (Remote e)
-      | Ok { result = Some r; _ } -> Ok r
-      | Ok _ -> Error (Local "Response has neither result nor error"))
+      | Ok r when r.jsonrpc <> "2.0" -> Error (Local "Invalid response JSON-RPC version")
+      | Ok r when r.id <> id -> Error (Local "Response id does not match request")
+      | Ok { error = Some e; result = None; _ } -> Error (Remote e)
+      | Ok { result = Some r; error = None; _ } -> Ok r
+      | Ok _ -> Error (Local "Response must have exactly one of result or error"))
 
 let result_type r =
   match Json.find "resultType" r with Some (Jsont.String (s, _)) -> s | _ -> "complete"
@@ -194,11 +206,14 @@ let typed codec = function
 (* Cacheable lists: every page, following cursors until exhausted (a cursor
    seen twice is a server bug, not a reason to loop), cached for the
    smallest ttlMs among the pages. *)
+let generation t method_ = Option.value (Hashtbl.find_opt t.generations method_) ~default:0
+
 let fetch_all t method_ key =
   let now = Unix.gettimeofday () in
   match Hashtbl.find_opt t.cache method_ with
   | Some c when c.expires > now -> Ok c.value
   | _ ->
+      let started = generation t method_ in
       let page = Proto.Page.codec ~items:key Jsont.json in
       let rec go seen acc ttl cursor =
         let params = Option.fold ~none:[] ~some:(fun c -> [ ("cursor", Json.str c) ]) cursor in
@@ -211,7 +226,7 @@ let fetch_all t method_ key =
             | Some _ -> Error (Local "Pagination cursor loop")
             | None ->
                 let value = List.rev acc in
-                if ttl > 0 then
+                if ttl > 0 && generation t method_ = started then
                   Hashtbl.replace t.cache method_ { expires = now +. (float ttl /. 1000.); value };
                 Ok value)
       in
@@ -227,7 +242,10 @@ let list_all t method_ key item =
                 (Result.map_error (fun m -> Local m) (Json.decode_json item j))))
         items (Ok []))
 
-let invalidate t method_ = Hashtbl.remove t.cache method_
+let invalidate t method_ =
+  Hashtbl.replace t.generations method_ (generation t method_ + 1);
+  Hashtbl.remove t.cache method_
+
 let discover t = typed Proto.Discover_result.codec (send t "server/discover" [])
 
 let list_tools t =
@@ -326,7 +344,7 @@ let listen t (filter : Proto.Filter.t) f =
    Requests are multiplexed: one reader fiber routes responses by id and
    notifications by progress token or subscription id. *)
 
-type pending = { resolve : (string, string) result Eio.Promise.u; on_note : string -> unit }
+type event = Note of string | Response of (string, string) result
 
 let route_probe =
   let meta = O.map Fun.id |> O.opt_mem Proto.key_subscription_id Id.codec |> O.finish in
@@ -343,16 +361,36 @@ let is_response raw =
   match Json.decode route_probe raw with Ok (Some _, None, _) -> true | _ -> false
 
 let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26) source sink =
-  let pending : (Id.t, pending) Hashtbl.t = Hashtbl.create 64 in
+  let pending : (Id.t, event Eio.Stream.t) Hashtbl.t = Hashtbl.create 64 in
+  let closed = ref None in
   let out = Eio.Stream.create max_int in
+  let notifications = Eio.Stream.create max_int in
+  let close message =
+    if !closed = None then (
+      closed := Some message;
+      Hashtbl.iter (fun _ events -> Eio.Stream.add events (Response (Error message))) pending;
+      Hashtbl.reset pending)
+  in
   Eio.Fiber.fork_daemon ~sw (fun () ->
-      Eio.Buf_write.with_flow sink (fun w ->
-          let rec loop () =
-            Eio.Buf_write.string w (Eio.Stream.take out);
-            Eio.Buf_write.char w '\n';
-            loop ()
-          in
-          loop ()));
+      while true do
+        on_notification (Eio.Stream.take notifications)
+      done;
+      `Stop_daemon);
+  Eio.Fiber.fork_daemon ~sw (fun () ->
+      match
+        Eio.Buf_write.with_flow sink (fun w ->
+            let rec loop () =
+              Eio.Buf_write.string w (Eio.Stream.take out);
+              Eio.Buf_write.char w '\n';
+              loop ()
+            in
+            loop ())
+      with
+      | result -> result
+      | exception (Eio.Cancel.Cancelled _ as e) -> raise e
+      | exception e ->
+          close (Printexc.to_string e);
+          `Stop_daemon);
   Eio.Fiber.fork_daemon ~sw (fun () ->
       let input = Eio.Buf_read.of_flow source ~max_size:max_message in
       let rec loop () =
@@ -360,36 +398,49 @@ let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26) sou
         (match Json.decode route_probe line with
         | Ok (Some id, None, _) ->
             Option.iter
-              (fun p ->
+              (fun events ->
                 Hashtbl.remove pending id;
-                Eio.Promise.resolve p.resolve (Ok line))
+                Eio.Stream.add events (Response (Ok line)))
               (Hashtbl.find_opt pending id)
         | Ok (None, Some _, Some id) when Hashtbl.mem pending id ->
-            (Hashtbl.find pending id).on_note line
-        | Ok (None, Some _, _) -> on_notification line
+            Eio.Stream.add (Hashtbl.find pending id) (Note line)
+        | Ok (None, Some _, _) -> Eio.Stream.add notifications line
         | _ -> ());
         loop ()
       in
       match loop () with
       | () -> `Stop_daemon
       | exception End_of_file ->
-          Hashtbl.iter
-            (fun _ p -> Eio.Promise.resolve p.resolve (Error "Connection closed"))
-            pending;
-          Hashtbl.reset pending;
+          close "Connection closed";
+          `Stop_daemon
+      | exception (Eio.Cancel.Cancelled _ as e) -> raise e
+      | exception e ->
+          close (Printexc.to_string e);
           `Stop_daemon);
   let send ~headers:_ ~id body ~on_note =
-    let response, resolve = Eio.Promise.create () in
-    Hashtbl.replace pending id { resolve; on_note };
-    Eio.Stream.add out body;
-    match Eio.Promise.await response with
-    | Ok r -> r
-    | Error msg -> failwith msg
-    | exception (Eio.Cancel.Cancelled _ as e) ->
-        Hashtbl.remove pending id;
-        Eio.Stream.add out
-          ("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":"
-         ^ Id.to_wire id ^ "}}");
+    Option.iter failwith !closed;
+    let events = Eio.Stream.create max_int in
+    Hashtbl.replace pending id events;
+    let rec receive () =
+      match Eio.Stream.take events with
+      | Note raw ->
+          on_note raw;
+          receive ()
+      | Response (Ok raw) -> raw
+      | Response (Error msg) -> failwith msg
+    in
+    match
+      Eio.Stream.add out body;
+      receive ()
+    with
+    | raw -> raw
+    | exception e ->
+        if Hashtbl.mem pending id then (
+          Hashtbl.remove pending id;
+          Eio.Cancel.protect (fun () ->
+              Eio.Stream.add out
+                ("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":"
+               ^ Id.to_wire id ^ "}}")));
         raise e
   in
   { send }

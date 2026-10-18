@@ -32,11 +32,14 @@ val v :
 (** A server advertising a feature for each of [tools], [resources] or [templates], and [prompts]
     that is given, even empty.
 
-    - [page_size] paginates list results (default: one page).
+    - [page_size] paginates list results (default: one page). Cursors are opaque and tied to the
+      listed contents and page size. If either changes, a stale cursor returns [-32602]; restart the
+      listing without a cursor.
     - [list_ttl_ms] and [list_scope] are the caching hints of list results and [server/discover]
       (default: 60s, public).
     - [state_key] is the MRTR [requestState] HMAC key. It defaults to a random key, so set it when
-      several processes serve the same clients.
+      several processes serve the same clients. State is bound to the method, target, principal and
+      original arguments. Object member ordering may change on retry; argument values may not.
     - [state_ttl_ms] is how long sealed state stays valid (default: 10min). *)
 
 val info : t -> Proto.Implementation.t

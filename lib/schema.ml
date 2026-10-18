@@ -8,12 +8,13 @@
 
 (* A header capture is (x-mcp-header name, value, value is an integer). *)
 type header = string * string * bool
-type binding = B : 'a Type.Id.t * 'a * header option -> binding
+type binding = B : 'a Type.Id.t * 'a * header list -> binding
 
 type 'a ty = {
   codec : 'a Jsont.t;
   schema : (string * Json.t) list;
   header : (bool * ('a -> string)) option;
+  captures : ('a * header list) Jsont.t option;
 }
 
 type field = {
@@ -27,22 +28,30 @@ type field = {
 type 'a t = { fields : field list; eval : binding list -> 'a * binding list }
 
 let string =
-  { codec = Jsont.string; schema = [ ("type", Json.str "string") ]; header = Some (false, Fun.id) }
+  {
+    codec = Jsont.string;
+    schema = [ ("type", Json.str "string") ];
+    header = Some (false, Fun.id);
+    captures = None;
+  }
 
 let int =
   {
     codec = Jsont.int;
     schema = [ ("type", Json.str "integer") ];
     header = Some (true, string_of_int);
+    captures = None;
   }
 
-let float = { codec = Jsont.number; schema = [ ("type", Json.str "number") ]; header = None }
+let float =
+  { codec = Jsont.number; schema = [ ("type", Json.str "number") ]; header = None; captures = None }
 
 let bool =
   {
     codec = Jsont.bool;
     schema = [ ("type", Json.str "boolean") ];
     header = Some (false, string_of_bool);
+    captures = None;
   }
 
 let enum cases =
@@ -54,6 +63,7 @@ let enum cases =
         ("type", Json.str "string"); ("enum", Json.list (List.map (fun (s, _) -> Json.str s) cases));
       ];
     header = Some (false, label);
+    captures = None;
   }
 
 let list ty =
@@ -61,10 +71,11 @@ let list ty =
     codec = Jsont.list ty.codec;
     schema = [ ("type", Json.str "array"); ("items", Json.obj ty.schema) ];
     header = None;
+    captures = None;
   }
 
 let json ?(schema = Json.empty) () =
-  { codec = Jsont.json; schema = Json.mems schema; header = None }
+  { codec = Jsont.json; schema = Json.mems schema; header = None; captures = None }
 
 let is_tchar = function
   | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' -> true
@@ -104,11 +115,21 @@ let take (type a) (id : a Type.Id.t) = function
 let field_of (type a b) ~name ~property ~required ~(absent : b option) (ty : a ty) (inj : a -> b)
     hdr : b t =
   let id : b Type.Id.t = Type.Id.make () in
-  let decode =
-    Jsont.map ty.codec ~dec:(fun v ->
-        B (id, inj v, Option.map (fun (h, numeric, repr) -> (h, repr v, numeric)) hdr))
+  let codec =
+    match ty.captures with
+    | Some codec -> codec
+    | None -> Jsont.map ty.codec ~dec:(fun v -> (v, []))
   in
-  let absent = Option.map (fun v -> B (id, v, None)) absent in
+  let decode =
+    Jsont.map codec ~dec:(fun (v, headers) ->
+        let headers =
+          match hdr with
+          | None -> headers
+          | Some (h, numeric, repr) -> (h, repr v, numeric) :: headers
+        in
+        B (id, inj v, headers))
+  in
+  let absent = Option.map (fun v -> B (id, v, [])) absent in
   { fields = [ { name; property; required; decode; absent } ]; eval = take id }
 
 let req ?doc ?header name ty =
@@ -181,7 +202,7 @@ let rec add_fields : type d.
   | Nil -> map
   | Cons (f, c) -> add_fields (Jsont.Object.mem f.name f.decode ?dec_absent:f.absent map) c
 
-let headers bindings = List.filter_map (fun (B (_, _, h)) -> h) bindings
+let headers bindings = List.concat_map (fun (B (_, _, h)) -> h) bindings
 
 let decoder ?(kind = "arguments") t =
   let (Chain c) = chain t.fields in
@@ -190,4 +211,12 @@ let decoder ?(kind = "arguments") t =
   |> Jsont.map ~dec:(fun bindings -> (fst (t.eval bindings), headers bindings))
 
 let codec ?kind t = Jsont.map ~dec:fst (decoder ?kind t)
-let obj t = { codec = codec ~kind:"object" t; schema = Json.mems (json_schema t); header = None }
+
+let obj t =
+  let captures = decoder ~kind:"object" t in
+  {
+    codec = Jsont.map ~dec:fst captures;
+    schema = Json.mems (json_schema t);
+    header = None;
+    captures = Some captures;
+  }

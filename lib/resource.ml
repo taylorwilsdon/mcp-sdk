@@ -68,25 +68,42 @@ module Uri_template = struct
     let l = String.length lit in
     pos + l <= String.length s && String.sub s pos l = lit
 
-  (* Variables match minimally and never empty; literals anchor them. *)
+  (* Work backwards to compute which suffixes match. Each variable remembers
+     the shortest successful end at each offset, avoiding backtracking and
+     repeated percent-decoding. Work is bounded by template length * URI length. *)
   let matches segments uri =
     let n = String.length uri in
-    let rec go segs pos acc =
-      match segs with
-      | [] -> if pos = n then Some (List.rev acc) else None
-      | Lit l :: rest -> if starts_at uri pos l then go rest (pos + String.length l) acc else None
-      | Var { name; reserved } :: rest ->
-          let rec try_end e =
-            if e > n || ((not reserved) && uri.[e - 1] = '/') then None
-            else
-              let value = pct_decode (String.sub uri pos (e - pos)) in
-              match go rest e ((name, value) :: acc) with
-              | Some _ as r -> r
-              | None -> try_end (e + 1)
-          in
-          try_end (pos + 1)
+    let terminal = Array.make (n + 1) false in
+    terminal.(n) <- true;
+    let reachable, plan =
+      List.fold_left
+        (fun (suffix, plan) segment ->
+          match segment with
+          | Lit literal ->
+              let len = String.length literal in
+              let reachable =
+                Array.init (n + 1) (fun pos ->
+                    pos + len <= n && suffix.(pos + len) && starts_at uri pos literal)
+              in
+              (reachable, (segment, [||]) :: plan)
+          | Var { reserved; _ } ->
+              let ends = Array.make (n + 1) (-1) in
+              for pos = n - 1 downto 0 do
+                if reserved || uri.[pos] <> '/' then
+                  ends.(pos) <- (if suffix.(pos + 1) then pos + 1 else ends.(pos + 1))
+              done;
+              (Array.map (( <= ) 0) ends, (segment, ends) :: plan))
+        (terminal, []) (List.rev segments)
     in
-    go segments 0 []
+    let rec capture pos acc = function
+      | [] -> Some (List.rev acc)
+      | (Lit literal, _) :: rest -> capture (pos + String.length literal) acc rest
+      | (Var { name; _ }, ends) :: rest ->
+          let last = ends.(pos) in
+          let value = pct_decode (String.sub uri pos (last - pos)) in
+          capture last ((name, value) :: acc) rest
+    in
+    if reachable.(0) then capture 0 [] plan else None
 end
 
 type template = {

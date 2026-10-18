@@ -3,7 +3,7 @@
      base64url(expiry_ms_be64 ^ payload) "." base64url(hmac_sha256)
 
    The MAC covers the payload, its expiry and a binding of the originating
-   method, target (tool name, prompt name or URI) and authenticated principal,
+   method, target, original arguments and authenticated principal,
    so state cannot be replayed late, on another request, or by another user. *)
 
 module H = Digestif.SHA256
@@ -12,11 +12,32 @@ let b64 = Base64.encode_string ~pad:false ~alphabet:Base64.uri_safe_alphabet
 let unb64 s = Base64.decode ~pad:false ~alphabet:Base64.uri_safe_alphabet s
 let now_ms () = Int64.of_float (Unix.gettimeofday () *. 1000.)
 
-let binding ~method_ ~target ~principal =
+(* Only evaluated for requests that issue or consume state. Sorting object
+   members makes insignificant ordering differences between retries harmless. *)
+let rec canonical = function
+  | Jsont.Object (members, _) ->
+      members
+      |> List.map (fun ((key, _), value) -> (key, canonical value))
+      |> List.sort (fun (a, _) (b, _) -> String.compare a b)
+      |> Json.obj
+  | Jsont.Array (items, _) -> Json.list (List.map canonical items)
+  | value -> value
+
+let arguments_codec =
+  let open Jsont.Object in
+  let params = map Fun.id |> mem "arguments" Jsont.json ~dec_absent:Json.empty |> finish in
+  map Fun.id |> mem "params" params |> finish
+
+let arguments_digest raw =
+  match Json.decode arguments_codec raw with
+  | Ok arguments -> H.to_hex (H.digest_string (Json.to_string (canonical arguments)))
+  | Error message -> invalid_arg message
+
+let binding ~method_ ~target ~principal ~arguments =
   String.concat ""
     (List.map
        (fun s -> string_of_int (String.length s) ^ ":" ^ s)
-       [ method_; target; Option.value principal ~default:"" ])
+       [ method_; target; Option.value principal ~default:""; arguments ])
 
 let mac ~key ~binding body = H.hmac_string ~key (binding ^ body)
 

@@ -388,8 +388,12 @@ let server_tests =
     Alcotest.test_case "pagination" `Quick (fun () ->
         let s = make_server ~page_size:2 () in
         let r = call s (req "tools/list" "") in
-        Alcotest.(check string) "cursor" "1" (str (get [ "result"; "nextCursor" ] r));
-        let r = call s (req "tools/list" {|,"cursor":"2"|}) in
+        let next r =
+          call s
+            (req "tools/list"
+               (",\"cursor\":" ^ Json.quote (str (get [ "result"; "nextCursor" ] r))))
+        in
+        let r = next (next r) in
         Alcotest.(check bool) "last page" true (get [ "result"; "nextCursor" ] r = None);
         check_code (-32602) (call s (req "tools/list" {|,"cursor":"9"|})));
     Alcotest.test_case "call" `Quick (fun () ->
@@ -783,6 +787,7 @@ let () =
       ("server", server_tests);
       ("mrtr", mrtr_tests);
       ("robustness", robustness_tests);
+      ("regressions", Regression.tests);
       ( "e2e",
         [
           Alcotest.test_case "stdio" `Quick stdio_test;

@@ -51,13 +51,16 @@ identity travel in `_meta`. The SDK is built around that.
   Responses are written as fragments around the request id, so a cached payload is never
   copied into a per-request string.
 - **MRTR without server state.** Handlers return `Input.required`. Any `requestState` is
-  sealed with HMAC-SHA256 over the payload, an expiry, and the method, target and
-  authenticated principal. It comes back verified through `Ctx.state`, and a tampered,
+  sealed with HMAC-SHA256 over the payload, an expiry, and the method, target,
+  authenticated principal and a canonical digest of the original arguments. It comes back verified through `Ctx.state`, and a tampered,
   expired or replayed-elsewhere state is rejected with -32602. Input requests the client
   has not declared a capability for are refused with -32021.
 - **Subscriptions that never block producers.** Changes bump counters in one atomic hub
   record and broadcast an `Eio.Condition`. Each `subscriptions/listen` stream diffs
   against what it last saw, so bursts coalesce and a slow listener cannot stall anyone.
+- **Consistent pagination.** Opaque cursors identify the listed contents and page size.
+  A registry change that affects the listing invalidates old cursors with -32602;
+  clients can restart without a cursor instead of silently skipping entries.
 - **Transports stay thin.** stdio (or any byte stream) runs one fiber per request and
   maps `notifications/cancelled` to fiber cancellation. Streamable HTTP answers with
   JSON, or upgrades lazily to an SSE stream scoped to the request the first time the

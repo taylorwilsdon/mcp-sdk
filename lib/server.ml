@@ -40,11 +40,13 @@ type registry = {
   prompts : Prompt.t list;
 }
 
+type listing_pages = { generation : string; bodies : string array }
+
 type pages = {
-  tool_pages : string array;
-  resource_pages : string array;
-  template_pages : string array;
-  prompt_pages : string array;
+  tool_pages : listing_pages;
+  resource_pages : listing_pages;
+  template_pages : listing_pages;
+  prompt_pages : listing_pages;
 }
 
 type snapshot = {
@@ -193,21 +195,33 @@ let rec chunk n l =
   else List.filteri (fun i _ -> i < n) l :: chunk n (List.filteri (fun i _ -> i >= n) l)
 
 let pages cfg ~key codec infos =
+  let generation =
+    Digestif.SHA256.(
+      to_hex
+        (digest_string
+           (key ^ ":"
+           ^ Option.fold ~none:"all" ~some:string_of_int cfg.page_size
+           ^ ":"
+           ^ Json.encode (Jsont.list codec) infos)))
+  in
   let pages = match cfg.page_size with None -> [ infos ] | Some n -> chunk n infos in
   let last = List.length pages - 1 in
   let page i items : _ Proto.Page.t =
     {
       items;
-      next_cursor = (if i < last then Some (string_of_int (i + 1)) else None);
+      next_cursor = (if i < last then Some (generation ^ ":" ^ string_of_int (i + 1)) else None);
       ttl_ms = cfg.list_ttl_ms;
       cache_scope = cfg.list_scope;
       meta = Some cfg.server_meta;
     }
   in
-  Array.of_list
-    (List.mapi
-       (fun i items -> Json.encode (Proto.Page.codec ~items:key codec) (page i items))
-       pages)
+  let bodies =
+    Array.of_list
+      (List.mapi
+         (fun i items -> Json.encode (Proto.Page.codec ~items:key codec) (page i items))
+         pages)
+  in
+  { generation; bodies }
 
 let sort what key l =
   let l = List.sort (fun a b -> String.compare (key a) (key b)) l in
@@ -366,7 +380,7 @@ let shutdown t = update_hub t (fun h -> { h with closed = true })
 
 (* Decoding *)
 
-type request = { id : Id.t; method_ : string; params : params; snap : snapshot }
+type request = { id : Id.t; method_ : string; params : params; snap : snapshot; raw : string }
 type incoming = Request of request | Cancel of Id.t | Ignore | Reject of Id.t option * Error.t
 
 let version_probe =
@@ -409,11 +423,13 @@ let decode t s =
   let snap = Atomic.get t.snapshot in
   match Json.decode snap.codec s with
   | Ok { jsonrpc = "2.0"; id = Some id; body = Request_body (method_, params) } ->
-      Request { id; method_; params; snap }
+      Request { id; method_; params; snap; raw = s }
   | Ok { jsonrpc = "2.0"; id = None; body = Cancel_body id } -> Cancel id
   | Ok { jsonrpc = "2.0"; id = None; body = Request_body _ } -> Ignore
   | Ok { id; _ } -> Reject (id, Error.invalid_request "Invalid JSON-RPC message")
   | Error msg -> classify snap s msg
+  | exception (Eio.Cancel.Cancelled _ as e) -> raise e
+  | exception e -> classify snap s (Printexc.to_string e)
 
 module Request = struct
   type t = request
@@ -455,17 +471,24 @@ let step cfg ctx ~binding codec with_meta = function
       with
       | [] ->
           let state =
-            Option.map (State.seal ~key:cfg.state_key ~binding ~ttl_ms:cfg.state_ttl_ms) r.state
+            Option.map
+              (fun state ->
+                State.seal ~key:cfg.state_key ~binding:(Lazy.force binding) ~ttl_ms:cfg.state_ttl_ms
+                  state)
+              r.state
           in
           Ok (Json.encode Proto.Input_required.codec { r with state })
       | missing -> Error (Error.missing_capability (Json.obj missing)))
 
 let page pages = function
-  | None -> Ok pages.(0)
+  | None -> Ok pages.bodies.(0)
   | Some c -> (
-      match int_of_string_opt c with
-      | Some i when i > 0 && i < Array.length pages -> Ok pages.(i)
-      | _ -> Error (Error.invalid_params "Invalid cursor"))
+      match String.split_on_char ':' c with
+      | [ generation; index ] when generation = pages.generation -> (
+          match int_of_string_opt index with
+          | Some i when i > 0 && i < Array.length pages.bodies -> Ok pages.bodies.(i)
+          | _ -> Error (Error.invalid_params "Invalid cursor"))
+      | _ -> Error (Error.invalid_params "Invalid or stale cursor; restart listing"))
 
 let subscription_note sub method_ rest =
   Wire.notification method_
@@ -534,7 +557,7 @@ let complete cfg snap ref_ arg value context =
 
 let run t snap ctx ~binding op =
   let cfg = t.cfg in
-  let step codec with_meta f = step cfg ctx ~binding codec with_meta (guard f) in
+  let step codec with_meta f = step cfg ctx ~binding codec with_meta (f ()) in
   match op with
   | Discover -> Ok snap.discover
   | List_tools c -> page snap.pages.tool_pages c
@@ -587,16 +610,22 @@ let execute t ?principal ~emit req =
     fail
       (Error.unsupported_version ~supported:supported_versions ~requested:p.meta.protocol_version)
   else
-    let binding = State.binding ~method_:req.method_ ~target:(Request.target req) ~principal in
+    let binding =
+      lazy
+        (State.binding ~method_:req.method_ ~target:(Request.target req) ~principal
+           ~arguments:(State.arguments_digest req.raw))
+    in
     let verified =
       match p.state with
       | None -> Ok None
-      | Some token -> Result.map Option.some (State.open_ ~key:t.cfg.state_key ~binding token)
+      | Some token ->
+          Result.map Option.some
+            (State.open_ ~key:t.cfg.state_key ~binding:(Lazy.force binding) token)
     in
     match verified with
     | Error msg -> fail (Error.invalid_params msg)
     | Ok state -> (
         let ctx = Ctx.make ~id:req.id ~meta:p.meta ~inputs:p.inputs ~state ~principal ~emit in
-        match run t req.snap ctx ~binding p.op with
+        match guard (fun () -> run t req.snap ctx ~binding p.op) with
         | Ok body -> (Wire.result req.id body, 200)
         | Error e -> fail e)

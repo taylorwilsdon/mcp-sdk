@@ -31,7 +31,7 @@ type 'a t
 (** An object schema producing ['a]. *)
 
 val obj : 'a t -> 'a ty
-(** A nested object. *)
+(** A nested object, preserving captures of header-annotated properties inside it. *)
 
 val req : ?doc:string -> ?header:string -> string -> 'a ty -> 'a t
 (** A required property. [header] mirrors the value into the [Mcp-Param-{header}] HTTP header

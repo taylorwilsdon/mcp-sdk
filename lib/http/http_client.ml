@@ -61,15 +61,28 @@ let headers body extra =
 let is_sse content_type =
   Option.fold ~none:false ~some:(String.starts_with ~prefix:"text/event-stream") content_type
 
-(* One exchange: [start finish] issues the request and returns how to abort
-   it; the caller blocks until [finish] is called. *)
-let exchange start =
-  let result, resolve = Eio.Promise.create () in
-  let abort = start (fun r -> ignore (Eio.Promise.try_resolve resolve r)) in
-  match Eio.Promise.await result with
-  | Ok body -> body
-  | Error msg -> failwith msg
-  | exception (Eio.Cancel.Cancelled _ as e) ->
+(* The connection reader queues events; the requesting fiber runs callbacks
+   in order, allowing them to make requests without blocking that reader. *)
+let exchange ~on_note start =
+  let events = Eio.Stream.create max_int and finished = ref false in
+  let finish result =
+    if not !finished then (
+      finished := true;
+      Eio.Stream.add events (`Response result))
+  in
+  let note raw = if not !finished then Eio.Stream.add events (`Note raw) in
+  let abort = start ~on_note:note finish in
+  let rec receive () =
+    match Eio.Stream.take events with
+    | `Note raw ->
+        on_note raw;
+        receive ()
+    | `Response (Ok body) -> body
+    | `Response (Error msg) -> failwith msg
+  in
+  match receive () with
+  | body -> body
+  | exception e ->
       Eio.Cancel.protect abort;
       raise e
 
@@ -80,18 +93,27 @@ let http1 ~sw ~net ?(host = Eio.Net.Ipaddr.V4.loopback) ?(path = "/mcp") ?(conne
   let authority = authority host port in
   let connect () =
     let socket = Eio.Net.connect ~sw net (`Tcp (host, port)) in
-    (Httpun_eio.Client.create_connection ~sw socket, socket)
+    (Httpun_eio.Client.create_connection ~sw socket, socket, ref false)
+  in
+  let dispose (conn, socket, disposed) =
+    Eio.Cancel.protect (fun () ->
+        if not !disposed then (
+          disposed := true;
+          Fun.protect
+            ~finally:(fun () -> Eio.Resource.close socket)
+            (fun () ->
+              let stopped = Httpun_eio.Client.shutdown conn in
+              Eio.Flow.shutdown socket `All;
+              Eio.Promise.await stopped)))
   in
   let pool =
     Eio.Pool.create connections connect
-      ~validate:(fun (c, _) -> not (Httpun_eio.Client.is_closed c))
-      ~dispose:(fun (c, socket) ->
-        ignore (Httpun_eio.Client.shutdown c);
-        Eio.Flow.shutdown socket `All)
+      ~validate:(fun (c, _, disposed) -> (not !disposed) && not (Httpun_eio.Client.is_closed c))
+      ~dispose
   in
   let send ~headers:extra ~id:_ body ~on_note =
-    Eio.Pool.use pool @@ fun (conn, socket) ->
-    exchange @@ fun finish ->
+    Eio.Pool.use pool @@ fun ((conn, _, _) as connection) ->
+    exchange ~on_note @@ fun ~on_note finish ->
     let headers = Httpun.Headers.of_list (("host", authority) :: headers body extra) in
     let response_handler (resp : Httpun.Response.t) reader =
       read_response
@@ -109,8 +131,6 @@ let http1 ~sw ~net ?(host = Eio.Net.Ipaddr.V4.loopback) ?(path = "/mcp") ?(conne
     Httpun.Body.Writer.write_string writer body;
     Httpun.Body.Writer.close writer;
     (* HTTP/1.1 can only abandon a response by dropping the connection. *)
-    fun () ->
-      ignore (Httpun_eio.Client.shutdown conn);
-      Eio.Flow.shutdown socket `All
+    fun () -> dispose connection
   in
   { send }

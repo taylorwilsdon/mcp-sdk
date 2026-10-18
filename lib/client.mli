@@ -16,7 +16,9 @@ type transport = {
   send : headers:(string * string) list -> id:Id.t -> string -> on_note:(string -> unit) -> string;
 }
 (** [send ~headers ~id body ~on_note] sends one request and blocks until its response, passing
-    request-scoped notifications to [on_note]. Cancelling the calling fiber cancels the request. *)
+    request-scoped notifications to [on_note]. Cancelling the calling fiber cancels the request. The
+    built-in transports run callbacks in the calling fiber, in wire order, before returning the
+    response. A callback may make another request; HTTP requires an available pool connection. *)
 
 type input_handler = string -> Proto.Input_request.t -> Json.t option
 (** Answer an input request (by key), e.g. an elicitation with an [ElicitResult] object. [None]
@@ -75,7 +77,8 @@ val request :
     8). *)
 
 val invalidate : t -> string -> unit
-(** Drop the cached result of a list method. *)
+(** Drop the cached result of a list method. Fetches already in progress may finish, but cannot
+    repopulate the cache with a result obtained across this invalidation. *)
 
 val line_transport :
   sw:Eio.Switch.t ->
@@ -86,7 +89,8 @@ val line_transport :
   transport
 (** Newline-delimited JSON-RPC, e.g. to a server's stdio. Requests are multiplexed by id; cancelling
     one sends [notifications/cancelled]. Notifications for no in-flight request go to
-    [on_notification]. *)
+    [on_notification], on a separate fiber. EOF or an I/O failure rejects both pending and future
+    sends. *)
 
 (**/**)
 
