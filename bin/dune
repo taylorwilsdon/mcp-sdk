@@ -1,0 +1,4 @@
+(executable
+ (public_name mcp-sdk)
+ (name main)
+ (libraries mcp mcp_http eio_main))

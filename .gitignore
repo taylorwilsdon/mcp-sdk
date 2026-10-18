@@ -1,0 +1,24 @@
+# Dune build output
+_build/
+*.install
+
+# Local opam switch (opam switch create .)
+_opam/
+
+# Legacy Merlin config (dune generates its own)
+.merlin
+
+# Coverage (bisect_ppx)
+_coverage/
+bisect*.coverage
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+\#*\#
+.#*
+
+# macOS
+.DS_Store

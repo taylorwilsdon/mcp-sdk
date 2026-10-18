@@ -1,0 +1,4 @@
+(library
+ (name mcp_http)
+ (public_name mcp-sdk.http)
+ (libraries mcp eio httpun-eio bigstringaf base64))
