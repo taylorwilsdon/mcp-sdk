@@ -1,7 +1,6 @@
 # mcp-sdk
 
-A Model Context Protocol SDK for OCaml 5, built on Eio, targeting protocol revision
-**2026-07-28**: the stateless revision with no `initialize` handshake, no sessions, multi
+A Model Context Protocol SDK for OCaml 5, built on Eio, targeting the latest MCP server protocol - **2026-07-28** as of writing. Full support for true stateless with no `initialize` handshake, no sessions, multi
 round-trip requests (MRTR), `subscriptions/listen` and cacheable results.
 
 ```ocaml
