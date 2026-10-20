@@ -5,11 +5,12 @@ type t = {
   state : string option;
   principal : string option;
   emit : Wire.t -> unit;
+  scope : Local.scope;
   mutable last_progress : float;
 }
 
-let make ~id ~meta ~inputs ~state ~principal ~emit =
-  { id; meta; inputs; state; principal; emit; last_progress = neg_infinity }
+let make ~id ~meta ~inputs ~state ~principal ~emit ~scope =
+  { id; meta; inputs; state; principal; emit; scope; last_progress = neg_infinity }
 
 let id t = t.id
 let emit t = t.emit
@@ -20,6 +21,7 @@ let principal t = t.principal
 let state t = t.state
 let meta t key = Json.find key t.meta.extra
 let input t key = List.assoc_opt key t.inputs
+let local t l = Local.get t.scope l
 
 let progress t ?total ?message value =
   match t.meta.progress_token with

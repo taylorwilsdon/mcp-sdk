@@ -1,21 +1,30 @@
 (* An applicative description of a JSON object that yields both its JSON
    Schema and a jsont codec decoding straight to a typed OCaml value.
 
-   Each field decodes to an existential [binding] keyed by a fresh type
-   witness. The compiled object map collects the bindings in field order and
-   [eval] consumes them in the same order, so no intermediate JSON tree is
-   built and no lookup by name happens at decode time. *)
+   A property type pairs a pure jsont decoder, from JSON to a representation
+   ['r], with a conversion from ['r] to the property's type, much as jsont's
+   own maps do. Decoding a message only runs the decoders: each field becomes
+   an existential [binding] keyed by a fresh type witness, collected in field
+   order with no intermediate JSON tree and no lookup by name. Conversions,
+   which are application code, run later when the request executes, by
+   consuming the bindings in that same order. *)
 
 (* A header capture is (x-mcp-header name, value, value is an integer). *)
 type header = string * string * bool
-type binding = B : 'a Type.Id.t * 'a * header list -> binding
 
-type 'a ty = {
-  codec : 'a Jsont.t;
-  schema : (string * Json.t) list;
-  header : (bool * ('a -> string)) option;
-  captures : ('a * header list) Jsont.t option;
-}
+type 'a ty =
+  | Ty : {
+      codec : 'r Jsont.t;
+      convert : 'r -> 'a;
+      captures : 'r -> header list;  (** Header values of nested properties. *)
+      header : (bool * ('r -> string)) option;  (** May mirror an [x-mcp-header]. *)
+      encode : 'a -> Json.t option;  (** For advertised defaults. *)
+      schema : (string * Json.t) list;
+    }
+      -> 'a ty
+
+(* A field's representation, [None] when absent, and its header captures. *)
+type binding = B : 'r Type.Id.t * 'r option * header list -> binding
 
 type field = {
   name : string;
@@ -27,72 +36,70 @@ type field = {
 
 type 'a t = { fields : field list; eval : binding list -> 'a * binding list }
 
-let string =
-  {
-    codec = Jsont.string;
-    schema = [ ("type", Json.str "string") ];
-    header = Some (false, Fun.id);
-    captures = None;
-  }
+(* A rejected conversion: the property path and why. *)
+exception Invalid of string list * string
 
-let int =
-  {
-    codec = Jsont.int;
-    schema = [ ("type", Json.str "integer") ];
-    header = Some (true, string_of_int);
-    captures = None;
-  }
+let no_captures _ = []
 
-let float =
-  { codec = Jsont.number; schema = [ ("type", Json.str "number") ]; header = None; captures = None }
+let prim ?header codec schema =
+  Ty
+    {
+      codec;
+      convert = Fun.id;
+      captures = no_captures;
+      header;
+      encode = (fun v -> Result.to_option (Jsont.Json.encode codec v));
+      schema;
+    }
 
-let bool =
-  {
-    codec = Jsont.bool;
-    schema = [ ("type", Json.str "boolean") ];
-    header = Some (false, string_of_bool);
-    captures = None;
-  }
+let string = prim Jsont.string [ ("type", Json.str "string") ] ~header:(false, Fun.id)
+let int = prim Jsont.int [ ("type", Json.str "integer") ] ~header:(true, string_of_int)
+let float = prim Jsont.number [ ("type", Json.str "number") ]
+let bool = prim Jsont.bool [ ("type", Json.str "boolean") ] ~header:(false, string_of_bool)
 
 let enum cases =
   let label v = fst (List.find (fun (_, v') -> v' = v) cases) in
-  {
-    codec = Jsont.enum cases;
-    schema =
-      [
-        ("type", Json.str "string"); ("enum", Json.list (List.map (fun (s, _) -> Json.str s) cases));
-      ];
-    header = Some (false, label);
-    captures = None;
-  }
+  prim (Jsont.enum cases)
+    [ ("type", Json.str "string"); ("enum", Json.list (List.map (fun (s, _) -> Json.str s) cases)) ]
+    ~header:(false, label)
 
-let list ty =
-  {
-    codec = Jsont.list ty.codec;
-    schema = [ ("type", Json.str "array"); ("items", Json.obj ty.schema) ];
-    header = None;
-    captures = None;
-  }
+let list (Ty t) =
+  let encode l =
+    let items = List.filter_map t.encode l in
+    if List.compare_lengths items l = 0 then Some (Json.list items) else None
+  in
+  Ty
+    {
+      codec = Jsont.list t.codec;
+      convert = List.map t.convert;
+      captures = no_captures;
+      header = None;
+      encode;
+      schema = [ ("type", Json.str "array"); ("items", Json.obj t.schema) ];
+    }
 
-let json ?(schema = Json.empty) () =
-  { codec = Jsont.json; schema = Json.mems schema; header = None; captures = None }
+let json = prim Jsont.json []
+let of_jsont ~schema codec = prim codec (Json.mems schema)
+
+let refine ?schema ?enc f (Ty t) =
+  let convert r = match f (t.convert r) with Ok v -> v | Error msg -> raise (Invalid ([], msg)) in
+  let encode = match enc with Some enc -> fun v -> t.encode (enc v) | None -> fun _ -> None in
+  Ty
+    {
+      codec = t.codec;
+      convert;
+      captures = t.captures;
+      header = t.header;
+      encode;
+      schema = t.schema @ Option.fold schema ~none:[] ~some:Json.mems;
+    }
 
 let is_tchar = function
   | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' -> true
   | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~' -> true
   | _ -> false
 
-let header_repr name header ty =
-  match (header, ty.header) with
-  | None, _ -> None
-  | Some h, _ when h = "" || not (String.for_all is_tchar h) ->
-      invalid_arg (Printf.sprintf "Schema: x-mcp-header %S on %S is not an HTTP token" h name)
-  | Some _, None ->
-      invalid_arg
-        (Printf.sprintf "Schema: x-mcp-header on %S needs a string, integer or boolean" name)
-  | Some h, Some (numeric, repr) -> Some (h, numeric, repr)
-
-let property ?doc ?header ?default ty =
+let property ?doc ?header ?default schema =
   let extra =
     List.concat
       [
@@ -101,53 +108,58 @@ let property ?doc ?header ?default ty =
         Option.fold default ~none:[] ~some:(fun d -> [ ("default", d) ]);
       ]
   in
-  Json.obj (ty.schema @ extra)
+  Json.obj (schema @ extra)
 
 (* Bindings are produced and consumed in field order, so the witness check in
    [take] can only fail if that invariant is broken inside this module. *)
-let take (type a) (id : a Type.Id.t) = function
+let take (type r) (id : r Type.Id.t) = function
   | B (id', v, _) :: rest -> (
       match Type.Id.provably_equal id id' with
-      | Some Type.Equal -> ((v : a), rest)
+      | Some Type.Equal -> ((v : r option), rest)
       | None -> invalid_arg "Schema: binding order invariant broken")
   | [] -> invalid_arg "Schema: binding order invariant broken"
 
-let field_of (type a b) ~name ~property ~required ~(absent : b option) (ty : a ty) (inj : a -> b)
-    hdr : b t =
-  let id : b Type.Id.t = Type.Id.make () in
-  let codec =
-    match ty.captures with
-    | Some codec -> codec
-    | None -> Jsont.map ty.codec ~dec:(fun v -> (v, []))
+(* A property [name] of type [ty], injected with [inj]; [absent] is its value
+   when missing, [None] if it is required. *)
+let field ?doc ?header ?default name (Ty t) inj absent =
+  let capture =
+    match (header, t.header) with
+    | None, _ -> None
+    | Some h, _ when h = "" || not (String.for_all is_tchar h) ->
+        invalid_arg (Printf.sprintf "Schema: x-mcp-header %S on %S is not an HTTP token" h name)
+    | Some _, None ->
+        invalid_arg
+          (Printf.sprintf "Schema: x-mcp-header on %S needs a string, integer or boolean" name)
+    | Some h, Some (numeric, repr) -> Some (fun r -> (h, repr r, numeric))
   in
+  let id = Type.Id.make () in
   let decode =
-    Jsont.map codec ~dec:(fun (v, headers) ->
-        let headers =
-          match hdr with
-          | None -> headers
-          | Some (h, numeric, repr) -> (h, repr v, numeric) :: headers
-        in
-        B (id, inj v, headers))
+    Jsont.map t.codec ~dec:(fun r ->
+        let nested = t.captures r in
+        B (id, Some r, match capture with Some c -> c r :: nested | None -> nested))
   in
-  let absent = Option.map (fun v -> B (id, v, [])) absent in
-  { fields = [ { name; property; required; decode; absent } ]; eval = take id }
+  let convert r =
+    try t.convert r with Invalid (path, msg) -> raise (Invalid (name :: path, msg))
+  in
+  let eval bindings =
+    let r, rest = take id bindings in
+    ((match r with Some r -> inj (convert r) | None -> Option.get absent), rest)
+  in
+  let property = property ?doc ?header ?default:(Option.bind default t.encode) t.schema in
+  let field =
+    {
+      name;
+      property;
+      required = Option.is_none absent;
+      decode;
+      absent = Option.map (fun _ -> B (id, None, [])) absent;
+    }
+  in
+  { fields = [ field ]; eval }
 
-let req ?doc ?header name ty =
-  let hdr = header_repr name header ty in
-  field_of ~name ~property:(property ?doc ?header ty) ~required:true ~absent:None ty Fun.id hdr
-
-let opt ?doc ?header name ty =
-  let hdr = header_repr name header ty in
-  field_of ~name ~property:(property ?doc ?header ty) ~required:false ~absent:(Some None) ty
-    Option.some hdr
-
-let dft ?doc ?header name ty default =
-  let hdr = header_repr name header ty in
-  let default_json = Result.to_option (Jsont.Json.encode ty.codec default) in
-  field_of ~name
-    ~property:(property ?doc ?header ?default:default_json ty)
-    ~required:false ~absent:(Some default) ty Fun.id hdr
-
+let req ?doc ?header name ty = field ?doc ?header name ty Fun.id None
+let opt ?doc ?header name ty = field ?doc ?header name ty Option.some (Some None)
+let dft ?doc ?header name ty default = field ?doc ?header ~default name ty Fun.id (Some default)
 let const v = { fields = []; eval = (fun bs -> (v, bs)) }
 let empty = const ()
 
@@ -202,21 +214,35 @@ let rec add_fields : type d.
   | Nil -> map
   | Cons (f, c) -> add_fields (Jsont.Object.mem f.name f.decode ?dec_absent:f.absent map) c
 
+let bindings ~kind t =
+  let (Chain c) = chain t.fields in
+  add_fields (Jsont.Object.map ~kind (curry c [])) c |> Jsont.Object.finish
+
 let headers bindings = List.concat_map (fun (B (_, _, h)) -> h) bindings
 
-let decoder ?(kind = "arguments") t =
-  let (Chain c) = chain t.fields in
-  add_fields (Jsont.Object.map ~kind (curry c [])) c
-  |> Jsont.Object.finish
-  |> Jsont.map ~dec:(fun bindings -> (fst (t.eval bindings), headers bindings))
+(* Conversions are application code: any failure but cancellation rejects the
+   arguments. *)
+let convert t bindings =
+  match fst (t.eval bindings) with
+  | v -> Ok v
+  | exception Invalid (path, msg) -> Error (String.concat "." path ^ ": " ^ msg)
+  | exception (Eio.Cancel.Cancelled _ as e) -> raise e
+  | exception e -> Error (Printexc.to_string e)
 
-let codec ?kind t = Jsont.map ~dec:fst (decoder ?kind t)
+let decoder ?(kind = "arguments") t =
+  Jsont.map (bindings ~kind t) ~dec:(fun bs -> ((fun () -> convert t bs), headers bs))
+
+let codec ?(kind = "arguments") t =
+  Jsont.map (bindings ~kind t) ~dec:(fun bs ->
+      match convert t bs with Ok v -> v | Error msg -> Jsont.Error.msg Jsont.Meta.none msg)
 
 let obj t =
-  let captures = decoder ~kind:"object" t in
-  {
-    codec = Jsont.map ~dec:fst captures;
-    schema = Json.mems (json_schema t);
-    header = None;
-    captures = Some captures;
-  }
+  Ty
+    {
+      codec = bindings ~kind:"object" t;
+      convert = (fun bs -> fst (t.eval bs));
+      captures = headers;
+      header = None;
+      encode = (fun _ -> None);
+      schema = Json.mems (json_schema t);
+    }

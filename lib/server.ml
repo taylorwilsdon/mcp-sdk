@@ -6,6 +6,8 @@ module Smap = Map.Make (String)
 type completion_ref = Ref_prompt of string | Ref_template of string
 
 type op =
+  | Initialize
+  | Ping
   | Discover
   | List_tools of string option
   | List_resources of string option
@@ -54,6 +56,7 @@ type snapshot = {
   resource_map : Resource.t Smap.t;
   prompt_map : Prompt.t Smap.t;
   pages : pages;
+  capabilities : Proto.Server_caps.t;
   discover : string;
   methods : string list;
   codec : envelope Jsont.t;
@@ -77,18 +80,23 @@ type config = {
    bursts of changes coalesce into one notification per listener. *)
 type hub = { tools_v : int; prompts_v : int; resources_v : int; uris : int Smap.t; closed : bool }
 
+(* Requests put to clients of earlier revisions, awaiting their answers. *)
+type pending = (Json.t, Error.t) result Eio.Promise.u Smap.t
+
 type t = {
   cfg : config;
   snapshot : snapshot Atomic.t;
   hub : hub Atomic.t;
   changed : Eio.Condition.t;
+  pending : pending Atomic.t;
+  asked : int Atomic.t;
 }
 
 let supported_versions = [ Proto.version ]
 
 (* Request codec *)
 
-let meta_mem map = O.mem "_meta" Proto.Meta.codec map
+let meta_mem map = O.mem "_meta" Proto.Meta.codec ~dec_absent:Proto.Meta.none map
 let inputs_codec = Jsont.map ~dec:Smap.bindings (O.as_string_map Jsont.json)
 
 let mrtr_mems map =
@@ -120,8 +128,22 @@ let argument =
 
 let context = O.map Fun.id |> O.mem "arguments" string_args ~dec_absent:[] |> O.finish
 
+let initialize =
+  O.map (fun requested client_caps client_info ->
+      let protocol_version =
+        if List.mem requested Proto.legacy_versions then requested
+        else List.hd Proto.legacy_versions
+      in
+      plain Initialize
+        { Proto.Meta.none with protocol_version; client_info = Some client_info; client_caps })
+  |> O.mem "protocolVersion" Jsont.string
+  |> O.mem "capabilities" Proto.Client_caps.codec
+  |> O.mem "clientInfo" Proto.Implementation.codec
+  |> O.finish
+
 let params_codecs reg ~completions =
   let discover = O.map (plain Discover) |> meta_mem |> O.finish in
+  let ping = O.map (plain Ping) |> meta_mem |> O.finish in
   let call =
     O.map (fun meta inputs state call -> { meta; inputs; state; op = Call call })
     |> meta_mem |> mrtr_mems
@@ -154,7 +176,12 @@ let params_codecs reg ~completions =
   let when_ b l = if b then l else [] in
   List.concat
     [
-      [ ("server/discover", discover); ("subscriptions/listen", listen) ];
+      [
+        ("initialize", initialize);
+        ("ping", ping);
+        ("server/discover", discover);
+        ("subscriptions/listen", listen);
+      ];
       when_ reg.features.tools
         [ ("tools/list", listing (fun c -> List_tools c)); ("tools/call", call) ];
       when_ reg.features.resources
@@ -172,10 +199,14 @@ let cancelled = O.map Fun.id |> O.mem "requestId" Id.codec |> O.finish
 
 let envelope_codec methods =
   let request (name, params) =
+    (* Earlier revisions omit [params] when it would be empty. *)
+    let params =
+      match Json.decode params "{}" with
+      | Ok empty -> O.mem "params" params ~dec_absent:empty
+      | Error _ -> O.mem "params" params
+    in
     O.Case.make
-      (O.Case.map name
-         ~dec:(fun p -> Request_body (name, p))
-         (O.map Fun.id |> O.mem "params" params |> O.finish))
+      (O.Case.map name ~dec:(fun p -> Request_body (name, p)) (O.map Fun.id |> params |> O.finish))
   in
   let cancel =
     O.Case.make
@@ -274,6 +305,7 @@ let build cfg reg =
     reg;
     resource_map = Smap.of_list (List.map (fun r -> (Resource.uri r, r)) reg.resources);
     prompt_map = Smap.of_list (List.map (fun p -> (Prompt.name p, p)) reg.prompts);
+    capabilities;
     pages =
       {
         tool_pages = pages cfg ~key:"tools" Proto.Tool_info.codec (List.map Tool.info reg.tools);
@@ -333,6 +365,8 @@ let v ?title ?description ?website_url ?(icons = []) ?instructions ?extensions ?
     hub =
       Atomic.make { tools_v = 0; prompts_v = 0; resources_v = 0; uris = Smap.empty; closed = false };
     changed = Eio.Condition.create ();
+    pending = Atomic.make Smap.empty;
+    asked = Atomic.make 0;
   }
 
 let info t = t.cfg.info
@@ -388,48 +422,75 @@ let version_probe =
   O.map Option.join |> O.opt_mem "_meta" meta |> O.finish
 
 let probe =
-  O.map (fun id m v -> (id, m, Option.join v))
+  O.map (fun id m v result error ->
+      let reply =
+        match (result, error) with
+        | Some r, _ -> Some (Ok r)
+        | None, Some e -> Some (Error e)
+        | None, None -> None
+      in
+      (id, m, Option.join v, reply))
   |> O.opt_mem "id" Id.codec |> O.opt_mem "method" Jsont.string |> O.opt_mem "params" version_probe
-  |> O.finish
+  |> O.opt_mem "result" Jsont.json |> O.opt_mem "error" Error.codec |> O.finish
 
-let not_found m =
-  if m = "initialize" then
-    Error.v Error.method_not_found_code
-      ("initialize is not supported: this server speaks MCP "
-      ^ String.concat ", " supported_versions
-      ^ " and expects per-request _meta")
-  else Error.method_not_found m
+let missing_meta =
+  Error.invalid_params ("Missing required _meta field " ^ Proto.key_protocol_version)
+
+let answer t id reply =
+  Option.iter
+    (fun u -> ignore (Eio.Promise.try_resolve u reply))
+    (Smap.find_opt (Id.to_wire id) (Atomic.get t.pending))
 
 (* Cold path: the typed decode failed, so find out why with cheap probes to
-   pick the right JSON-RPC error and recover the id when possible. *)
-let classify snap s msg =
+   pick the right JSON-RPC error and recover the id when possible. Responses
+   to requests put to the client also arrive here. *)
+let classify t snap ?session s msg =
   match Json.decode probe s with
   | Error _ -> (
       match Json.decode Jsont.ignore s with
       | Error _ -> Reject (None, Error.parse_error "Parse error")
       | Ok () -> Reject (None, Error.invalid_request "Invalid JSON-RPC message"))
-  | Ok (None, _, _) -> Ignore
-  | Ok (Some id, None, _) -> Reject (Some id, Error.invalid_request "Missing method")
-  | Ok (Some id, Some m, _) when not (List.mem m snap.methods) -> Reject (Some id, not_found m)
-  | Ok (Some id, Some _, Some v) when not (List.mem v supported_versions) ->
+  | Ok (None, _, _, _) -> Ignore
+  | Ok (Some id, None, _, Some reply) ->
+      answer t id reply;
+      Ignore
+  | Ok (Some id, None, _, None) -> Reject (Some id, Error.invalid_request "Missing method")
+  | Ok (Some id, Some m, _, _) when not (List.mem m snap.methods) ->
+      Reject (Some id, Error.method_not_found m)
+  | Ok (Some id, Some _, Some v, _) when not (List.mem v supported_versions) ->
       Reject (Some id, Error.unsupported_version ~supported:supported_versions ~requested:v)
-  | Ok (Some id, Some _, None) ->
-      Reject
-        ( Some id,
-          Error.invalid_params ("Missing required _meta field " ^ Proto.key_protocol_version) )
-  | Ok (Some id, Some _, Some _) -> Reject (Some id, Error.invalid_params msg)
+  | Ok (Some id, Some m, None, _) when Option.is_none session && m <> "initialize" ->
+      Reject (Some id, missing_meta)
+  | Ok (Some id, Some _, _, _) -> Reject (Some id, Error.invalid_params msg)
 
-let decode t s =
+(* Requests of earlier revisions carry no protocol version in [_meta]: they
+   take their session's, as negotiated by [initialize]. *)
+let resolve ?session req =
+  let p = req.params and reject e = Reject (Some req.id, e) in
+  match (p.op, p.meta.protocol_version, session) with
+  | Initialize, _, _ -> Request req
+  | _, "", Some (s : Proto.Meta.t) when List.mem s.protocol_version Proto.legacy_versions ->
+      let meta = { s with progress_token = p.meta.progress_token; extra = p.meta.extra } in
+      Request { req with params = { p with meta } }
+  | _, "", Some s ->
+      reject
+        (Error.unsupported_version ~supported:Proto.legacy_versions ~requested:s.protocol_version)
+  | _, "", None -> reject missing_meta
+  | Ping, _, _ -> reject (Error.method_not_found req.method_)
+  | _, v, _ when List.mem v supported_versions -> Request req
+  | _, v, _ -> reject (Error.unsupported_version ~supported:supported_versions ~requested:v)
+
+let decode t ?session s =
   let snap = Atomic.get t.snapshot in
   match Json.decode snap.codec s with
   | Ok { jsonrpc = "2.0"; id = Some id; body = Request_body (method_, params) } ->
-      Request { id; method_; params; snap; raw = s }
+      resolve ?session { id; method_; params; snap; raw = s }
   | Ok { jsonrpc = "2.0"; id = None; body = Cancel_body id } -> Cancel id
   | Ok { jsonrpc = "2.0"; id = None; body = Request_body _ } -> Ignore
   | Ok { id; _ } -> Reject (id, Error.invalid_request "Invalid JSON-RPC message")
-  | Error msg -> classify snap s msg
+  | Error msg -> classify t snap ?session s msg
   | exception (Eio.Cancel.Cancelled _ as e) -> raise e
-  | exception e -> classify snap s (Printexc.to_string e)
+  | exception e -> classify t snap ?session s (Printexc.to_string e)
 
 module Request = struct
   type t = request
@@ -437,6 +498,7 @@ module Request = struct
   let id r = r.id
   let method_ r = r.method_
   let protocol_version r = r.params.meta.protocol_version
+  let session r = match r.params.op with Initialize -> Some r.params.meta | _ -> None
 
   let target r =
     match r.params.op with
@@ -460,7 +522,7 @@ let with_server_info cfg = function
   | Some (Jsont.Object (mems, m)) -> Some (Jsont.Object (cfg.server_info :: mems, m))
   | _ -> Some cfg.server_meta
 
-let step cfg ctx ~binding codec with_meta = function
+let step ctx ~required codec with_meta = function
   | Error e -> Error e
   | Ok (Input.Complete v) -> Ok (Json.encode codec (with_meta v))
   | Ok (Input.Required (r : Input.required)) -> (
@@ -469,16 +531,33 @@ let step cfg ctx ~binding codec with_meta = function
         List.sort_uniq compare
           (List.filter_map (fun (_, q) -> Input.missing_capability caps q) r.requests)
       with
-      | [] ->
-          let state =
-            Option.map
-              (fun state ->
-                State.seal ~key:cfg.state_key ~binding:(Lazy.force binding) ~ttl_ms:cfg.state_ttl_ms
-                  state)
-              r.state
-          in
-          Ok (Json.encode Proto.Input_required.codec { r with state })
+      | [] -> required r
       | missing -> Error (Error.missing_capability (Json.obj missing)))
+
+let rec swap a f =
+  let v = Atomic.get a in
+  if not (Atomic.compare_and_set a v (f v)) then swap a f
+
+(* Put an input request to a client of an earlier revision as a request of
+   its own, on the stream of the request that needs it. Ids are MACs of a
+   counter, so no client can guess another's and answer in its place. *)
+let ask t emit (key, (q : Input.request)) =
+  let n = Atomic.fetch_and_add t.asked 1 in
+  let id =
+    Id.String Digestif.SHA256.(to_hex (hmac_string ~key:t.cfg.state_key (string_of_int n)))
+  in
+  let answered, resolver = Eio.Promise.create () in
+  swap t.pending (Smap.add (Id.to_wire id) resolver);
+  Fun.protect ~finally:(fun () -> swap t.pending (Smap.remove (Id.to_wire id))) @@ fun () ->
+  emit (Wire.request id q.method_ (Json.to_string q.params));
+  match Eio.Promise.await answered with
+  | Ok answer -> Ok (key, answer)
+  | Error (e : Error.t) -> Error (Error.internal_error (q.method_ ^ " failed: " ^ e.message))
+
+let rec ask_all t emit = function
+  | [] -> Ok []
+  | q :: rest ->
+      Result.bind (ask t emit q) (fun a -> Result.map (List.cons a) (ask_all t emit rest))
 
 let page pages = function
   | None -> Ok pages.bodies.(0)
@@ -555,10 +634,20 @@ let complete cfg snap ref_ arg value context =
         (Json.encode Proto.Completion.codec
            (Proto.Completion.v ~total ~has_more:(total > 100) shown, Some cfg.server_meta))
 
-let run t snap ctx ~binding op =
+let run t snap ctx ~required op =
   let cfg = t.cfg in
-  let step codec with_meta f = step cfg ctx ~binding codec with_meta (f ()) in
+  let step codec with_meta f = step ctx ~required codec with_meta (f ()) in
   match op with
+  | Initialize ->
+      Ok
+        (Json.encode Proto.Initialize_result.codec
+           {
+             protocol_version = Ctx.protocol_version ctx;
+             capabilities = snap.capabilities;
+             server_info = cfg.info;
+             instructions = cfg.instructions;
+           })
+  | Ping -> Ok "{}"
   | Discover -> Ok snap.discover
   | List_tools c -> page snap.pages.tool_pages c
   | List_resources c -> page snap.pages.resource_pages c
@@ -603,29 +692,37 @@ let run t snap ctx ~binding op =
   | Complete { ref_; arg; value; context } -> complete cfg snap ref_ arg value context
   | Listen filter -> Ok (listen t ctx filter)
 
-let execute t ?principal ~emit req =
-  let p = req.params in
-  let fail e = (Wire.error ~id:req.id e, Error.http_status e) in
-  if not (List.mem p.meta.protocol_version supported_versions) then
-    fail
-      (Error.unsupported_version ~supported:supported_versions ~requested:p.meta.protocol_version)
-  else
-    let binding =
-      lazy
-        (State.binding ~method_:req.method_ ~target:(Request.target req) ~principal
-           ~arguments:(State.arguments_digest req.raw))
+let execute t ?principal ~scope ~emit req =
+  let p = req.params and cfg = t.cfg in
+  let binding =
+    lazy
+      (State.binding ~method_:req.method_ ~target:(Request.target req) ~principal
+         ~arguments:(State.arguments_digest req.raw))
+  in
+  let seal (r : Input.required) =
+    let seal =
+      State.seal ~key:cfg.state_key ~binding:(Lazy.force binding) ~ttl_ms:cfg.state_ttl_ms
     in
-    let verified =
-      match p.state with
-      | None -> Ok None
-      | Some token ->
-          Result.map Option.some
-            (State.open_ ~key:t.cfg.state_key ~binding:(Lazy.force binding) token)
+    Ok (Json.encode Proto.Input_required.codec { r with state = Option.map seal r.state })
+  in
+  (* Earlier revisions have no MRTR, so the server asks the client itself and
+     runs the handler again with the answers, its state never leaving memory. *)
+  let rec attempt ~inputs ~state =
+    let ctx = Ctx.make ~id:req.id ~meta:p.meta ~inputs ~state ~principal ~emit ~scope in
+    let required (r : Input.required) =
+      if p.meta.protocol_version = Proto.version then seal r
+      else Result.bind (ask_all t emit r.requests) (fun inputs -> attempt ~inputs ~state:r.state)
     in
-    match verified with
-    | Error msg -> fail (Error.invalid_params msg)
-    | Ok state -> (
-        let ctx = Ctx.make ~id:req.id ~meta:p.meta ~inputs:p.inputs ~state ~principal ~emit in
-        match guard (fun () -> run t req.snap ctx ~binding p.op) with
-        | Ok body -> (Wire.result req.id body, 200)
-        | Error e -> fail e)
+    guard (fun () -> run t req.snap ctx ~required p.op)
+  in
+  let verified =
+    match p.state with
+    | None -> Ok None
+    | Some token ->
+        State.open_ ~key:cfg.state_key ~binding:(Lazy.force binding) token
+        |> Result.map Option.some
+        |> Result.map_error (fun msg -> Error.invalid_params msg)
+  in
+  match Result.bind verified (fun state -> attempt ~inputs:p.inputs ~state) with
+  | Ok body -> (Wire.result req.id body, 200)
+  | Error e -> (Wire.error ~id:req.id e, Error.http_status e)

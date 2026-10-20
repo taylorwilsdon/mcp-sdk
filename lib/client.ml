@@ -340,11 +340,69 @@ let listen t (filter : Proto.Filter.t) f =
   let notifications = Result.get_ok (Jsont.Json.encode Proto.Filter.codec filter) in
   Result.map ignore (send t ~on_note "subscriptions/listen" [ ("notifications", notifications) ])
 
+(* What a transport's reader hands to the fiber waiting on a request: its
+   notifications, for that fiber to run as callbacks, then its response. The
+   reader never waits on it, so it can always route the responses callbacks
+   are waiting for. The stream is unbounded, but holds at most [max_queued]
+   bytes of notifications (any single one is admitted) and one response.
+   Past that, a request fails without running further callbacks, while
+   notifications for no request are dropped. *)
+module Inbox = struct
+  type event = Note of string | Response of (string, string) result
+
+  type t = {
+    events : event Eio.Stream.t;
+    max_queued : int;
+    overflow : [ `Fail | `Drop ];
+    mutable queued : int;
+    mutable answered : bool;
+    mutable overflowed : bool;
+  }
+
+  let overflow_message = "Notification backlog exceeded"
+
+  let create ~max_queued ~overflow =
+    {
+      events = Eio.Stream.create max_int;
+      max_queued;
+      overflow;
+      queued = 0;
+      answered = false;
+      overflowed = false;
+    }
+
+  let respond t result =
+    if not t.answered then (
+      t.answered <- true;
+      Eio.Stream.add t.events (Response result))
+
+  let note t raw =
+    let size = String.length raw in
+    if t.answered then ()
+    else if t.queued > 0 && t.queued + size > t.max_queued then
+      match t.overflow with
+      | `Fail ->
+          t.overflowed <- true;
+          respond t (Error overflow_message)
+      | `Drop -> ()
+    else (
+      t.queued <- t.queued + size;
+      Eio.Stream.add t.events (Note raw))
+
+  let rec receive t ~on_note =
+    match Eio.Stream.take t.events with
+    | Note _ when t.overflowed -> failwith overflow_message
+    | Note raw ->
+        t.queued <- t.queued - String.length raw;
+        on_note raw;
+        receive t ~on_note
+    | Response (Ok raw) -> raw
+    | Response (Error msg) -> failwith msg
+end
+
 (* Newline-delimited transport over a byte stream, e.g. a server's stdio.
    Requests are multiplexed: one reader fiber routes responses by id and
    notifications by progress token or subscription id. *)
-
-type event = Note of string | Response of (string, string) result
 
 let route_probe =
   let meta = O.map Fun.id |> O.opt_mem Proto.key_subscription_id Id.codec |> O.finish in
@@ -360,21 +418,22 @@ let route_probe =
 let is_response raw =
   match Json.decode route_probe raw with Ok (Some _, None, _) -> true | _ -> false
 
-let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26) source sink =
-  let pending : (Id.t, event Eio.Stream.t) Hashtbl.t = Hashtbl.create 64 in
+let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26)
+    ?(max_queued = 1 lsl 22) source sink =
+  let pending : (Id.t, Inbox.t) Hashtbl.t = Hashtbl.create 64 in
   let closed = ref None in
+  (* Unbounded, yet it holds at most a request and a cancellation per send
+     in flight, and a bound could hold up the protected cancellation. *)
   let out = Eio.Stream.create max_int in
-  let notifications = Eio.Stream.create max_int in
+  let unsolicited = Inbox.create ~max_queued ~overflow:`Drop in
   let close message =
     if !closed = None then (
       closed := Some message;
-      Hashtbl.iter (fun _ events -> Eio.Stream.add events (Response (Error message))) pending;
+      Hashtbl.iter (fun _ inbox -> Inbox.respond inbox (Error message)) pending;
       Hashtbl.reset pending)
   in
   Eio.Fiber.fork_daemon ~sw (fun () ->
-      while true do
-        on_notification (Eio.Stream.take notifications)
-      done;
+      ignore (Inbox.receive unsolicited ~on_note:on_notification);
       `Stop_daemon);
   Eio.Fiber.fork_daemon ~sw (fun () ->
       match
@@ -398,13 +457,13 @@ let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26) sou
         (match Json.decode route_probe line with
         | Ok (Some id, None, _) ->
             Option.iter
-              (fun events ->
+              (fun inbox ->
                 Hashtbl.remove pending id;
-                Eio.Stream.add events (Response (Ok line)))
+                Inbox.respond inbox (Ok line))
               (Hashtbl.find_opt pending id)
         | Ok (None, Some _, Some id) when Hashtbl.mem pending id ->
-            Eio.Stream.add (Hashtbl.find pending id) (Note line)
-        | Ok (None, Some _, _) -> Eio.Stream.add notifications line
+            Inbox.note (Hashtbl.find pending id) line
+        | Ok (None, Some _, _) -> Inbox.note unsolicited line
         | _ -> ());
         loop ()
       in
@@ -419,19 +478,11 @@ let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26) sou
           `Stop_daemon);
   let send ~headers:_ ~id body ~on_note =
     Option.iter failwith !closed;
-    let events = Eio.Stream.create max_int in
-    Hashtbl.replace pending id events;
-    let rec receive () =
-      match Eio.Stream.take events with
-      | Note raw ->
-          on_note raw;
-          receive ()
-      | Response (Ok raw) -> raw
-      | Response (Error msg) -> failwith msg
-    in
+    let inbox = Inbox.create ~max_queued ~overflow:`Fail in
+    Hashtbl.replace pending id inbox;
     match
       Eio.Stream.add out body;
-      receive ()
+      Inbox.receive inbox ~on_note
     with
     | raw -> raw
     | exception e ->

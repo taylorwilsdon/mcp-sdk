@@ -1,3 +1,12 @@
 (test
  (name test_mcp)
- (libraries mcp mcp_http alcotest eio_main eio.unix))
+ (libraries
+  mcp
+  mcp_http
+  alcotest
+  eio_main
+  eio.unix
+  eio.mock
+  httpun
+  httpun-eio
+  gluten))

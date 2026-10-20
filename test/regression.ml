@@ -19,10 +19,16 @@ let request ?(id = 1) method_ params =
          ("params", Json.obj (("_meta", meta) :: params));
        ])
 
+(* Requests executed directly, on a scope of a mock event loop. *)
+let with_scope f =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio.Switch.run @@ fun sw -> f (Local.scope sw)
+
 let execute server ?principal raw =
   match Server.decode server raw with
   | Server.Request req ->
-      fst (Server.execute server ?principal ~emit:ignore req) |> Wire.to_string |> parse
+      with_scope (fun scope -> fst (Server.execute server ?principal ~scope ~emit:ignore req))
+      |> Wire.to_string |> parse
   | Server.Reject (id, error) -> Wire.error ?id error |> Wire.to_string |> parse
   | _ -> Alcotest.fail "expected a request or rejection"
 
@@ -90,7 +96,7 @@ let state_binding () =
     | None -> Ok (Input.required ~state:"approved" [])
     | Some _ -> Ok (Tool.text "resumed")
   in
-  let s = server [ Tool.v "resume" Schema.(req "data" (json ())) resume ] in
+  let s = server [ Tool.v "resume" Schema.(req "data" json) resume ] in
   let original = parse {|{"data":{"a":1,"b":[2,3]}}|} in
   let first = execute s ~principal:"alice" (call "resume" original []) in
   let state = field [ "result"; "requestState" ] first in
@@ -219,12 +225,12 @@ let pagination () =
       Alcotest.(check string) "restart includes b" "b" (string (field [ "name" ] first))
   | _ -> Alcotest.fail "expected tools"
 
-let with_stdio env server f =
+let with_stdio ?max_requests ?max_queued env server f =
   try
     Eio.Switch.run @@ fun sw ->
     let c2s_r, c2s_w = Eio_unix.pipe sw and s2c_r, s2c_w = Eio_unix.pipe sw in
-    Eio.Fiber.fork ~sw (fun () -> Stdio.serve server c2s_r s2c_w);
-    let client = Client.connect (Client.line_transport ~sw s2c_r c2s_w) in
+    Eio.Fiber.fork ~sw (fun () -> Stdio.serve ?max_requests server c2s_r s2c_w);
+    let client = Client.connect (Client.line_transport ~sw ?max_queued s2c_r c2s_w) in
     Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 3. (fun () -> f client);
     Eio.Switch.fail sw Exit
   with Exit -> ()
@@ -277,11 +283,11 @@ let eof env =
       local (Client.discover client);
       local (Client.discover client))
 
-let with_http env server f =
+let with_http ?domains env server f =
   let net = Eio.Stdenv.net env and clock = Eio.Stdenv.clock env in
   let port = 20000 + Random.int 30000 in
   Eio.Fiber.first
-    (fun () -> Mcp_http.serve ~net ~clock ~port ~keepalive:0.01 server)
+    (fun () -> Mcp_http.serve ?domains ~net ~clock ~port ~keepalive:0.01 server)
     (fun () ->
       try
         Eio.Switch.run @@ fun sw ->
@@ -374,6 +380,246 @@ let http_callbacks env =
              failwith "callback failed"));
       ignore (ok (Client.call_tool client "ok" Json.empty)))
 
+(* One server over two domains: each domain makes its own Local value, on
+   which the handler can fork, and a tool added later is served everywhere. *)
+let http_domains env =
+  let made = ref [] and lock = Mutex.create () in
+  let local =
+    Local.v (fun sw ->
+        Mutex.protect lock (fun () -> made := Domain.self () :: !made);
+        sw)
+  in
+  let fork =
+    Tool.v "fork" Schema.empty (fun ctx () ->
+        Eio.Fiber.fork ~sw:(Ctx.local ctx local) ignore;
+        Ok (Tool.text "ok"))
+  in
+  let s = server [ fork ] in
+  with_http
+    ~domains:(Eio.Stdenv.domain_mgr env, 1)
+    env s
+    (fun ~sw ~net ~port ->
+      let client = Client.connect (Mcp_http.Client.http1 ~sw ~net ~port ~connections:8 ()) in
+      let calls name =
+        Eio.Fiber.List.iter
+          (fun () -> ignore (ok (Client.call_tool client name Json.empty)))
+          (List.init 32 ignore)
+      in
+      calls "fork";
+      let domains = List.sort_uniq compare !made in
+      Alcotest.(check int) "one value per domain" (List.length domains) (List.length !made);
+      Server.add_tool s (tool "added");
+      calls "added")
+
+(* Values are made once per scope, again after a failure, and only on the
+   scope's own domain. *)
+let local_values env =
+  let attempts = ref 0 in
+  let flaky =
+    Local.v (fun _ ->
+        incr attempts;
+        if !attempts = 1 then failwith "first attempt";
+        !attempts)
+  in
+  Eio.Switch.run @@ fun sw ->
+  let scope = Local.scope sw in
+  Alcotest.check_raises "failure reaches the caller" (Failure "first attempt") (fun () ->
+      ignore (Local.get scope flaky));
+  Alcotest.(check int) "made again" 2 (Local.get scope flaky);
+  Alcotest.(check int) "then kept" 2 (Local.get scope flaky);
+  Alcotest.check_raises "other domains are refused"
+    (Invalid_argument "Local.get: scope used from another domain") (fun () ->
+      Eio.Domain_manager.run (Eio.Stdenv.domain_mgr env) (fun () -> ignore (Local.get scope flaky)))
+
+let text response =
+  match field [ "result"; "content" ] response with
+  | Jsont.Array ([ content ], _) -> string (field [ "text" ] content)
+  | _ -> Alcotest.fail "expected one content item"
+
+(* Conversions run when a request executes, never while it is decoded;
+   refinements and imported codecs advertise what they check. *)
+let conversions () =
+  let converted = ref 0 in
+  let positive n = if n > 0 then Ok n else Error "must be positive" in
+  let count =
+    Schema.(refine ~schema:(Json.obj [ ("minimum", Json.int 1) ]) ~enc:Fun.id positive int)
+  in
+  let shape =
+    Schema.of_jsont
+      ~schema:(parse {|{"type":["string","integer"]}|})
+      Jsont.(
+        any
+          ~dec_string:(map ~dec:(fun s -> `Name s) string)
+          ~dec_number:(map ~dec:(fun n -> `Id (Float.to_int n)) number)
+          ())
+  in
+  let args =
+    Schema.(
+      let+ n = dft "n" count 3 and+ shape = req "shape" shape and+ _ = opt "any" json in
+      incr converted;
+      (n, shape))
+  in
+  let echo =
+    Tool.v "echo" args (fun _ (n, shape) ->
+        Ok
+          (Tool.text
+             (match shape with `Name s -> s ^ string_of_int n | `Id i -> string_of_int (i + n))))
+  in
+  let s = server [ echo ] in
+  let raw arguments = call "echo" (parse arguments) [] in
+  (match Server.decode s (raw {|{"shape":"a"}|}) with
+  | Server.Request req ->
+      Alcotest.(check int) "decoding converts nothing" 0 !converted;
+      ignore (with_scope (fun scope -> Server.execute s ~scope ~emit:ignore req));
+      Alcotest.(check int) "execution converts" 1 !converted
+  | _ -> Alcotest.fail "expected a request");
+  Alcotest.(check string) "default" "a3" (text (execute s (raw {|{"shape":"a"}|})));
+  Alcotest.(check string) "union" "7" (text (execute s (raw {|{"shape":2,"n":5}|})));
+  let refused = execute s (raw {|{"shape":"a","n":0}|}) in
+  check_error (-32602) refused;
+  Alcotest.(check string)
+    "names the property" "n: must be positive"
+    (string (field [ "error"; "message" ] refused));
+  check_error (-32602) (execute s (raw {|{"shape":true}|}));
+  Alcotest.(check string)
+    "advertised schema"
+    {|{"n":{"type":"integer","minimum":1,"default":3},"shape":{"type":["string","integer"]},"any":{}}|}
+    (Json.to_string (field [ "properties" ] (Schema.json_schema args)))
+
+(* With one request admitted, another is refused at once, while the reader
+   still delivers the cancellation that frees the slot. *)
+let stdio_admission env =
+  let clock = Eio.Stdenv.clock env in
+  let started, signal = Eio.Promise.create () in
+  let slow =
+    Tool.v "slow" Schema.empty (fun _ () ->
+        Eio.Promise.resolve signal ();
+        Eio.Time.sleep clock 10.;
+        Ok (Tool.text "done"))
+  in
+  with_stdio ~max_requests:1 env
+    (server [ slow; tool "ok" ])
+    (fun client ->
+      Eio.Fiber.first
+        (fun () -> ignore (Client.call_tool client "slow" Json.empty))
+        (fun () ->
+          Eio.Promise.await started;
+          match Client.call_tool client "ok" Json.empty with
+          | Error (Client.Remote e) ->
+              Alcotest.(check string) "busy" "Too many requests in flight" e.message
+          | _ -> Alcotest.fail "expected a busy error");
+      (* The slot frees once the cancelled request has unwound. *)
+      let rec retry n =
+        match Client.call_tool client "ok" Json.empty with
+        | Error (Client.Remote { code = -32603; _ }) when n > 0 ->
+            Eio.Time.sleep clock 0.01;
+            retry (n - 1)
+        | result -> ignore (ok result)
+      in
+      retry 100)
+
+(* A callback slower than the notifications it receives fails its request
+   once [max_queued] bytes are waiting, and the server stops the handler. *)
+let chatty_server clock active =
+  let chatty =
+    Tool.v "chatty" Schema.empty (fun ctx () ->
+        incr active;
+        Fun.protect
+          ~finally:(fun () -> decr active)
+          (fun () ->
+            for i = 1 to 1000 do
+              Ctx.progress ctx (float i)
+            done;
+            Eio.Time.sleep clock 10.;
+            Ok (Tool.text "done")))
+  in
+  server [ chatty; tool "ok" ]
+
+let check_backlog clock active client =
+  let slow_callback ?total:_ ?message:_ _ = Eio.Time.sleep clock 0.01 in
+  local (Client.call_tool client "chatty" Json.empty ~on_progress:slow_callback);
+  let rec settled n =
+    !active = 0
+    || n > 0
+       &&
+       (Eio.Time.sleep clock 0.01;
+        settled (n - 1))
+  in
+  Alcotest.(check bool) "handler cancelled" true (settled 100);
+  ignore (ok (Client.call_tool client "ok" Json.empty))
+
+let stdio_backlog env =
+  let clock = Eio.Stdenv.clock env and active = ref 0 in
+  with_stdio ~max_queued:256 env (chatty_server clock active) (check_backlog clock active)
+
+let http_backlog env =
+  let clock = Eio.Stdenv.clock env and active = ref 0 in
+  with_http env (chatty_server clock active) (fun ~sw ~net ~port ->
+      check_backlog clock active
+        (Client.connect (Mcp_http.Client.http1 ~sw ~net ~port ~max_queued:256 ())))
+
+(* An application's own httpun-eio server mounts the endpoint next to its
+   other routes, and the client reaches it through its own [connect]. *)
+let http_embedded env =
+  let net = Eio.Stdenv.net env in
+  let config = Mcp_http.config ~clock:(Eio.Stdenv.clock env) () in
+  let s = server [ tool "ok" ] in
+  try
+    Eio.Switch.run @@ fun sw ->
+    let loopback = Eio.Net.Ipaddr.V4.loopback in
+    let socket = Eio.Net.listen ~sw ~backlog:16 ~reuse_addr:true net (`Tcp (loopback, 0)) in
+    let port = match Eio.Net.listening_addr socket with `Tcp (_, p) -> p | _ -> assert false in
+    let scope = Local.scope sw in
+    let connection flow addr =
+      Eio.Switch.run @@ fun sw ->
+      let request_handler _ ({ reqd; _ } : Httpun.Reqd.t Gluten.reqd) =
+        match (Httpun.Reqd.request reqd).target with
+        | "/mcp" ->
+            Eio.Fiber.fork ~sw (fun () ->
+                Mcp_http.handle config s ~scope (Mcp_http.Http1.exchange reqd))
+        | _ ->
+            let headers = Httpun.Headers.of_list [ ("content-length", "0") ] in
+            Httpun.Reqd.respond_with_string reqd (Httpun.Response.create ~headers `Not_found) ""
+      in
+      let error_handler _ ?request:_ _ start =
+        Httpun.Body.Writer.close (start Httpun.Headers.empty)
+      in
+      Httpun_eio.Server.create_connection_handler ~sw ~request_handler ~error_handler addr flow
+    in
+    Eio.Fiber.fork_daemon ~sw (fun () -> Eio.Net.run_server ~on_error:ignore socket connection);
+    let connects = ref 0 in
+    let transport ?path () =
+      Mcp_http.Client.v ~sw ?path ~authority:"localhost" (fun sw ->
+          incr connects;
+          Eio.Net.connect ~sw net (`Tcp (loopback, port)))
+    in
+    let client = Client.connect (transport ()) in
+    ignore (ok (Client.call_tool client "ok" Json.empty));
+    ignore (ok (Client.call_tool client "ok" Json.empty));
+    Alcotest.(check int) "one kept-alive connection" 1 !connects;
+    local (Client.discover (Client.connect (transport ~path:"/elsewhere" ())));
+    Eio.Switch.fail sw Exit
+  with Exit -> ()
+
+let shortest_numbers () =
+  let check expected json = Alcotest.(check string) expected expected (Json.to_string json) in
+  check "9.3" (Json.num 9.3);
+  check "0.30000000000000004" (Json.num (0.1 +. 0.2));
+  check "-1.5e-300" (Json.num (-1.5e-300));
+  check "12345678901234568" (Json.num 12345678901234567.);
+  check {|{"9.3000000000000007":"\"1.0000000000000002"}|}
+    (Json.obj [ ("9.3000000000000007", Json.str {|"1.0000000000000002|}) ]);
+  check "[52.52437,13.41053,null]"
+    (Json.list [ Json.num 52.52437; Json.num 13.41053; Json.num nan ]);
+  Random.init 7;
+  for _ = 1 to 10_000 do
+    let f = Int64.float_of_bits (Random.bits64 ()) in
+    if Float.is_finite f then
+      match parse (Json.to_string (Json.num f)) with
+      | Jsont.Number (g, _) when Int64.equal (Int64.bits_of_float g) (Int64.bits_of_float f) -> ()
+      | _ -> Alcotest.failf "%h does not round-trip" f
+  done
+
 let test name f = Alcotest.test_case name `Quick f
 let io name f = test name (fun () -> Eio_main.run f)
 
@@ -387,10 +633,18 @@ let tests =
     test "response envelope validation" response_envelopes;
     test "invalidation during list fetch" invalidation;
     test "pagination rejects stale generations" pagination;
+    test "numbers use their shortest exact form" shortest_numbers;
+    test "conversions run at execution" conversions;
     io "callbacks can reenter the client" callback;
     io "stdio survives decoder and completion errors" stdio_exceptions;
     io "calls after EOF fail promptly" eof;
     io "HTTP validates nested headers" http_headers;
     io "HTTP cancellation closes descriptors" http_cleanup;
     io "HTTP callbacks can reenter and fail safely" http_callbacks;
+    io "HTTP shares one server across domains" http_domains;
+    io "Local values are made per scope" local_values;
+    io "stdio refuses requests beyond its limit" stdio_admission;
+    io "stdio client bounds notification backlog" stdio_backlog;
+    io "HTTP client bounds notification backlog" http_backlog;
+    io "HTTP endpoint mounts in another server" http_embedded;
   ]

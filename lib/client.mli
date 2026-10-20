@@ -16,9 +16,14 @@ type transport = {
   send : headers:(string * string) list -> id:Id.t -> string -> on_note:(string -> unit) -> string;
 }
 (** [send ~headers ~id body ~on_note] sends one request and blocks until its response, passing
-    request-scoped notifications to [on_note]. Cancelling the calling fiber cancels the request. The
-    built-in transports run callbacks in the calling fiber, in wire order, before returning the
-    response. A callback may make another request; HTTP requires an available pool connection. *)
+    request-scoped notifications to [on_note]. Cancelling the calling fiber cancels the request.
+
+    The built-in transports share one contract. Their reader never waits on application code, so
+    responses keep flowing whatever callbacks do. Callbacks run in the calling fiber, in wire order,
+    before the response is returned, and may make other requests (over HTTP, given a free pool
+    connection). Notifications wait for their callbacks in a queue of at most [max_queued] bytes per
+    request; a request whose queue would exceed it fails with a [Local] error and is cancelled,
+    rather than letting a slow callback grow memory without bound. *)
 
 type input_handler = string -> Proto.Input_request.t -> Json.t option
 (** Answer an input request (by key), e.g. an elicitation with an [ElicitResult] object. [None]
@@ -84,15 +89,28 @@ val line_transport :
   sw:Eio.Switch.t ->
   ?on_notification:(string -> unit) ->
   ?max_message:int ->
+  ?max_queued:int ->
   _ Eio.Flow.source ->
   _ Eio.Flow.sink ->
   transport
 (** Newline-delimited JSON-RPC, e.g. to a server's stdio. Requests are multiplexed by id; cancelling
     one sends [notifications/cancelled]. Notifications for no in-flight request go to
-    [on_notification], on a separate fiber. EOF or an I/O failure rejects both pending and future
+    [on_notification], on a separate fiber, and are dropped while more than [max_queued] bytes of
+    them wait for it. [max_message] bounds one incoming message (default 64MiB) and [max_queued]
+    each notification queue (default 4MiB). EOF or an I/O failure rejects both pending and future
     sends. *)
 
 (**/**)
 
 val is_response : string -> bool
+
+module Inbox : sig
+  type t
+
+  val create : max_queued:int -> overflow:[ `Fail | `Drop ] -> t
+  val note : t -> string -> unit
+  val respond : t -> (string, string) result -> unit
+  val receive : t -> on_note:(string -> unit) -> string
+end
+
 val header_params : Proto.Tool_info.t -> (string list * string) list option

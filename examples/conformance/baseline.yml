@@ -1,0 +1,7 @@
+# Not provided to 2025-11-25 clients: logging, and resource subscriptions,
+# which that revision delivers outside a request.
+server:
+  - logging-set-level
+  - tools-call-with-logging
+  - resources-subscribe
+  - resources-unsubscribe

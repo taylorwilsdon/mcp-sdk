@@ -26,18 +26,22 @@ let exchange reqd : Exchange.t =
         in
         {
           write = Body.Writer.write_string w;
-          flush = (fun k -> Body.Writer.flush w (fun r -> k (r = `Closed)));
+          flush =
+            (fun () ->
+              let flushed, resolve = Eio.Promise.create () in
+              Body.Writer.flush w (Eio.Promise.resolve resolve);
+              Eio.Promise.await flushed);
           close = (fun () -> Body.Writer.close w);
         });
   }
 
-let connection_handler cfg server =
+let connection_handler cfg server ~scope =
  fun socket addr ->
   Exchange.with_connection @@ fun sw ->
   let request_handler _addr (gluten : Reqd.t Gluten.reqd) =
     let reqd = gluten.reqd in
     Eio.Fiber.fork ~sw (fun () ->
-        match Exchange.handle cfg server (exchange reqd) with
+        match Exchange.handle cfg server ~scope (exchange reqd) with
         | () -> ()
         | exception (Eio.Cancel.Cancelled _ as e) -> raise e
         | exception e -> Reqd.report_exn reqd e)

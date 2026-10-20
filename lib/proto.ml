@@ -4,6 +4,9 @@
 module O = Jsont.Object
 
 let version = "2026-07-28"
+
+(* Revisions served through an [initialize] handshake, latest first. *)
+let legacy_versions = [ "2025-11-25"; "2025-06-18" ]
 let key_protocol_version = "io.modelcontextprotocol/protocolVersion"
 let key_client_info = "io.modelcontextprotocol/clientInfo"
 let key_client_capabilities = "io.modelcontextprotocol/clientCapabilities"
@@ -374,7 +377,7 @@ module Server_caps = struct
      subscriptions/listen, so the sub-objects are fixed. *)
   let feature value = Jsont.map ~dec:(fun _ -> true) ~enc:(fun _ -> value) Jsont.json
 
-  let codec =
+  let make ~list_changed ~resources_caps =
     O.map ~kind:"server capabilities" (fun tools resources prompts completions extensions ->
         { tools; resources; prompts; completions; extensions })
     |> O.mem "tools" (feature list_changed) ~dec_absent:false ~enc:(fun c -> c.tools) ~enc_omit:not
@@ -387,6 +390,12 @@ module Server_caps = struct
     |> presence_mem "completions" (fun c -> c.completions)
     |> O.opt_mem "extensions" Jsont.json ~enc:(fun c -> c.extensions)
     |> O.finish
+
+  let codec = make ~list_changed ~resources_caps
+
+  (* Earlier revisions only notify outside a request, which a stateless
+     server cannot do, so they are offered no notifications. *)
+  let legacy_codec = make ~list_changed:Json.empty ~resources_caps:Json.empty
 end
 
 module Meta = struct
@@ -399,13 +408,31 @@ module Meta = struct
     extra : Json.t;  (** Every other [_meta] key, e.g. trace context. *)
   }
 
+  (* The [_meta] of a request from an earlier revision: the protocol version
+     comes from its session instead. *)
+  let none =
+    {
+      protocol_version = "";
+      client_info = None;
+      client_caps = Client_caps.none;
+      progress_token = None;
+      log_level = None;
+      extra = Json.empty;
+    }
+
   let codec =
     O.map ~kind:"request _meta"
       (fun protocol_version client_info client_caps progress_token log_level extra ->
+        let client_caps =
+          match (protocol_version, client_caps) with
+          | _, Some caps -> caps
+          | "", None -> Client_caps.none
+          | _, None -> Jsont.Error.msg Jsont.Meta.none ("Missing " ^ key_client_capabilities)
+        in
         { protocol_version; client_info; client_caps; progress_token; log_level; extra })
-    |> O.mem key_protocol_version Jsont.string ~enc:(fun m -> m.protocol_version)
+    |> O.mem key_protocol_version Jsont.string ~dec_absent:"" ~enc:(fun m -> m.protocol_version)
     |> O.opt_mem key_client_info Implementation.codec ~enc:(fun m -> m.client_info)
-    |> O.mem key_client_capabilities Client_caps.codec ~enc:(fun m -> m.client_caps)
+    |> O.opt_mem key_client_capabilities Client_caps.codec ~enc:(fun m -> Some m.client_caps)
     |> O.opt_mem "progressToken" Id.codec ~enc:(fun m -> m.progress_token)
     |> O.opt_mem key_log_level Jsont.string ~enc:(fun m -> m.log_level)
     |> O.keep_unknown Jsont.json_mems ~enc:(fun m -> m.extra)
@@ -514,6 +541,24 @@ module Discover_result = struct
     |> O.mem "cacheScope" cache_scope ~dec_absent:Private ~enc:(fun r -> r.cache_scope)
     |> meta_mem (fun r -> r.meta)
     |> complete |> O.finish
+end
+
+module Initialize_result = struct
+  type t = {
+    protocol_version : string;
+    capabilities : Server_caps.t;
+    server_info : Implementation.t;
+    instructions : string option;
+  }
+
+  let codec =
+    O.map ~kind:"initialize result" (fun protocol_version capabilities server_info instructions ->
+        { protocol_version; capabilities; server_info; instructions })
+    |> O.mem "protocolVersion" Jsont.string ~enc:(fun r -> r.protocol_version)
+    |> O.mem "capabilities" Server_caps.legacy_codec ~enc:(fun r -> r.capabilities)
+    |> O.mem "serverInfo" Implementation.codec ~enc:(fun r -> r.server_info)
+    |> opt_string "instructions" (fun r -> r.instructions)
+    |> O.finish
 end
 
 module Page = struct

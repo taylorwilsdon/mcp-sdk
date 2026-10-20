@@ -63,36 +63,19 @@ let is_sse content_type =
 
 (* The connection reader queues events; the requesting fiber runs callbacks
    in order, allowing them to make requests without blocking that reader. *)
-let exchange ~on_note start =
-  let events = Eio.Stream.create max_int and finished = ref false in
-  let finish result =
-    if not !finished then (
-      finished := true;
-      Eio.Stream.add events (`Response result))
-  in
-  let note raw = if not !finished then Eio.Stream.add events (`Note raw) in
-  let abort = start ~on_note:note finish in
-  let rec receive () =
-    match Eio.Stream.take events with
-    | `Note raw ->
-        on_note raw;
-        receive ()
-    | `Response (Ok body) -> body
-    | `Response (Error msg) -> failwith msg
-  in
-  match receive () with
+let exchange ~max_queued ~on_note start =
+  let inbox = Mcp.Client.Inbox.create ~max_queued ~overflow:`Fail in
+  let abort = start ~on_note:(Mcp.Client.Inbox.note inbox) (Mcp.Client.Inbox.respond inbox) in
+  match Mcp.Client.Inbox.receive inbox ~on_note with
   | body -> body
   | exception e ->
       Eio.Cancel.protect abort;
       raise e
 
-let authority host port = Format.asprintf "%a:%d" Eio.Net.Ipaddr.pp host port
-
-let http1 ~sw ~net ?(host = Eio.Net.Ipaddr.V4.loopback) ?(path = "/mcp") ?(connections = 64) ~port
-    () : Mcp.Client.transport =
-  let authority = authority host port in
+let v ~sw ?(path = "/mcp") ?(connections = 64) ?(max_queued = 1 lsl 22) ~authority connect :
+    Mcp.Client.transport =
   let connect () =
-    let socket = Eio.Net.connect ~sw net (`Tcp (host, port)) in
+    let socket = connect sw in
     (Httpun_eio.Client.create_connection ~sw socket, socket, ref false)
   in
   let dispose (conn, socket, disposed) =
@@ -113,7 +96,7 @@ let http1 ~sw ~net ?(host = Eio.Net.Ipaddr.V4.loopback) ?(path = "/mcp") ?(conne
   in
   let send ~headers:extra ~id:_ body ~on_note =
     Eio.Pool.use pool @@ fun ((conn, _, _) as connection) ->
-    exchange ~on_note @@ fun ~on_note finish ->
+    exchange ~max_queued ~on_note @@ fun ~on_note finish ->
     let headers = Httpun.Headers.of_list (("host", authority) :: headers body extra) in
     let response_handler (resp : Httpun.Response.t) reader =
       read_response
@@ -134,3 +117,8 @@ let http1 ~sw ~net ?(host = Eio.Net.Ipaddr.V4.loopback) ?(path = "/mcp") ?(conne
     fun () -> dispose connection
   in
   { send }
+
+let http1 ~sw ~net ?(host = Eio.Net.Ipaddr.V4.loopback) ?path ?connections ?max_queued ~port () =
+  let authority = Format.asprintf "%a:%d" Eio.Net.Ipaddr.pp host port in
+  v ~sw ?path ?connections ?max_queued ~authority (fun sw ->
+      Eio.Net.connect ~sw net (`Tcp (host, port)))

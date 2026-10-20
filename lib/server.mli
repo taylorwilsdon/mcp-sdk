@@ -3,11 +3,26 @@
     A server is an immutable registry snapshot published through an [Atomic.t]: requests on any
     fiber or domain read it without locking, and updates swap in a new snapshot whose list results
     are serialized once. Every request is handled on its own, as the stateless 2026-07-28 protocol
-    intends. *)
+    intends.
+
+    Clients of revisions 2025-11-25 and 2025-06-18 are served too. Their [initialize] opens a
+    session: the negotiated version, client info and capabilities that later requests of the session
+    would otherwise carry in [_meta]. The transport keeps it, so the server still holds no state per
+    client. Handlers need no changes: when one returns {!Input.required}, the server puts each input
+    request to the client itself and runs the handler again with the answers. Change notifications
+    and resource subscriptions are not offered to these clients, since earlier revisions only
+    deliver them outside a request.
+
+    One server serves every domain: registry changes, subscription notifications and the
+    [requestState] key are shared by all of them. Handlers run on whichever domain serves the
+    request, so anything they capture must be safe to use from any domain; keep resources bound to
+    one domain in {!Local} values. *)
 
 type t
 
 val supported_versions : string list
+(** The revisions served without a session. {!Proto.legacy_versions} are served through
+    [initialize]. *)
 
 val v :
   ?title:string ->
@@ -72,13 +87,21 @@ type incoming =
   | Ignore  (** A notification needing no action. *)
   | Reject of Id.t option * Error.t  (** Answer with this error. *)
 
-val decode : t -> string -> incoming
+val decode : t -> ?session:Proto.Meta.t -> string -> incoming
 (** Decode one JSON-RPC message: envelope, method parameters and typed tool arguments in a single
-    pass. *)
+    pass. It runs no application code beyond the codecs given to {!Schema.of_jsont}: conversions
+    such as {!Schema.map} and {!Schema.refine} run in {!execute}, so a transport can decode on its
+    reader without handlers stalling it.
 
-val execute : t -> ?principal:string -> emit:(Wire.t -> unit) -> request -> Wire.t * int
-(** Run a request, returning its response and the HTTP status it implies. Request-scoped
-    notifications go to [emit] before the response. *)
+    [session] is the one {!Request.session} opened for the peer, if any. A client's answer to a
+    request the server put to it is taken here and comes back as [Ignore]. *)
+
+val execute :
+  t -> ?principal:string -> scope:Local.scope -> emit:(Wire.t -> unit) -> request -> Wire.t * int
+(** Run a request, returning its response and the HTTP status it implies. [scope] holds the {!Local}
+    values of the calling domain. Request-scoped notifications go to [emit] before the response;
+    [emit] may block until the peer accepts them, which is how a slow client holds back a handler
+    that keeps emitting. *)
 
 module Request : sig
   type t = request
@@ -86,6 +109,10 @@ module Request : sig
   val id : t -> Id.t
   val method_ : t -> string
   val protocol_version : t -> string
+
+  val session : t -> Proto.Meta.t option
+  (** The session an [initialize] request opens, for the transport to pass to {!decode} with the
+      peer's later messages. *)
 
   val target : t -> string
   (** The tool or prompt name, or resource URI, of the request. *)

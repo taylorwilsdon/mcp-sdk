@@ -1,0 +1,9 @@
+[project]
+name = "weather"
+version = "1.0.0"
+description = "Current weather from Open-Meteo, served over MCP with FastMCP"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=4.1.1,<5",
+    "httpx",
+]

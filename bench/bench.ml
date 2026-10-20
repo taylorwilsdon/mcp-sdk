@@ -37,10 +37,12 @@ let report name n seconds latencies =
         (pct 0.99)
 
 let core name ~n server line =
+  Eio.Switch.run @@ fun sw ->
+  let scope = Local.scope sw in
   let t0 = Unix.gettimeofday () in
   for _ = 1 to n do
     match Server.decode server line with
-    | Server.Request r -> ignore (Server.execute server ~emit:ignore r)
+    | Server.Request r -> ignore (Server.execute server ~scope ~emit:ignore r)
     | _ -> failwith "bench request did not decode"
   done;
   report name n (Unix.gettimeofday () -. t0) None

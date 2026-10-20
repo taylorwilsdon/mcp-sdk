@@ -1,15 +1,27 @@
 (* Newline-delimited JSON-RPC over any byte stream: the stdio transport, but
    equally a Unix socket or TCP connection. One reader loop, a fiber per
    request, and a shared buffered writer that coalesces concurrent replies
-   into as few writes as the kernel will take. *)
+   into as few writes as the kernel will take.
 
-let serve ?(max_message = 1 lsl 26) server source sink =
+   The reader never waits: requests beyond [max_requests] are refused at
+   once, so cancellations always get through. Requests do wait when more than
+   [high_water] bytes of output are unwritten, so a peer that stops reading
+   stops handlers rather than growing the buffer. *)
+
+let high_water = 1 lsl 20
+
+let serve ?(max_message = 1 lsl 26) ?(max_requests = 1024) server source sink =
   Eio.Switch.run @@ fun sw ->
   Eio.Buf_write.with_flow sink @@ fun w ->
   let send wire =
     Wire.iter (Eio.Buf_write.string w) wire;
     Eio.Buf_write.char w '\n'
   in
+  let send_paced wire =
+    send wire;
+    if Eio.Buf_write.pending_bytes w > high_water then Eio.Buf_write.flush w
+  in
+  let scope = Local.scope sw in
   let inflight : (Id.t, unit Eio.Promise.u) Hashtbl.t = Hashtbl.create 64 in
   let cancel u = ignore (Eio.Promise.try_resolve u ()) in
   let run req =
@@ -19,16 +31,24 @@ let serve ?(max_message = 1 lsl 26) server source sink =
     Eio.Fiber.fork ~sw (fun () ->
         Eio.Fiber.first
           (fun () ->
-            let wire, _status = Server.execute server ~emit:send req in
-            send wire)
+            let wire, _status = Server.execute server ~scope ~emit:send_paced req in
+            send_paced wire)
           (fun () -> Eio.Promise.await cancelled);
         match Hashtbl.find_opt inflight id with
         | Some r when r == resolver -> Hashtbl.remove inflight id
         | _ -> ())
   in
+  (* A 2025-11-25 session lasts as long as the connection. *)
+  let session = ref None in
   let handle line =
-    match Server.decode server line with
-    | Server.Request req -> run req
+    match Server.decode server ?session:!session line with
+    | Server.Request req when Hashtbl.length inflight >= max_requests ->
+        send
+          (Wire.error ~id:(Server.Request.id req)
+             (Error.internal_error "Too many requests in flight"))
+    | Request req ->
+        Option.iter (fun s -> session := Some s) (Server.Request.session req);
+        run req
     | Cancel id -> Option.iter cancel (Hashtbl.find_opt inflight id)
     | Ignore -> ()
     | Reject (id, e) -> send (Wire.error ?id e)

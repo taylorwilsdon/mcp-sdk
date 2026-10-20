@@ -1,0 +1,3 @@
+(executable
+ (name weather)
+ (libraries mcp mcp_http eio_main httpun-eio bigstringaf))

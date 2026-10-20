@@ -18,7 +18,8 @@ val find : string -> t -> t option
 val find_path : string list -> t -> t option
 
 val encode : 'a Jsont.t -> 'a -> string
-(** Minified JSON.
+(** Minified JSON. Numbers are written with the fewest digits that read back exactly, e.g. [9.3]
+    rather than [9.3000000000000007].
     @raise Invalid_argument if the codec cannot encode. *)
 
 val decode : 'a Jsont.t -> string -> ('a, string) result

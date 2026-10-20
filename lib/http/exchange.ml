@@ -1,11 +1,12 @@
 (* Streamable HTTP (2026-07-28) request handling. [Http1] presents each
-   httpun request as an [exchange], which keeps this module free of httpun. *)
+   httpun request as an exchange, which keeps this module free of httpun and
+   lets an application present requests from any other HTTP server. *)
 
 open Mcp
 
 type writer = {
   write : string -> unit;
-  flush : (bool -> unit) -> unit;  (** Argument: the peer has gone away. *)
+  flush : unit -> [ `Written | `Closed ];
   close : unit -> unit;
 }
 
@@ -42,6 +43,16 @@ let loopback_origin origin =
         else match String.index_opt host ':' with Some j -> String.sub host 0 j | None -> host
       in
       List.mem host [ "localhost"; "127.0.0.1"; "[::1]" ]
+
+let config ?(allow_origin = loopback_origin) ?(authenticate = fun _ -> Ok None)
+    ?(max_body = 1 lsl 22) ?(keepalive = 15.0) ~clock () =
+  {
+    allow_origin;
+    authenticate;
+    max_body;
+    keepalive;
+    clock :> float Eio.Time.clock_ty Eio.Resource.t;
+  }
 
 (* Collect a request body delivered through httpun style callbacks. *)
 let read_body ~schedule_read ~close ~max =
@@ -113,30 +124,45 @@ let validate_headers x req =
       check ("mcp-param-" ^ String.lowercase_ascii name) value ~numeric)
     (Ok ()) (header_args req)
 
+(* A 2025-11-25 session is the client's own [initialize] parameters, so its
+   id is simply their encoding: the client sends them back with every request
+   and the server keeps nothing. *)
+let b64 = Base64.uri_safe_alphabet
+
+let session_id meta =
+  Base64.encode_string ~pad:false ~alphabet:b64 (Json.encode Proto.Meta.codec meta)
+
+let session_of_id id =
+  match Base64.decode ~pad:false ~alphabet:b64 id with
+  | Ok s -> Result.to_option (Json.decode Proto.Meta.codec s)
+  | Error _ -> None
+
 let event w wire =
   w.write "data: ";
   Wire.iter w.write wire;
   w.write "\n\n"
 
 (* Respond with JSON unless the handler emits before finishing, in which case
-   switch to an SSE stream scoped to this request. The stream closing is the
-   cancellation signal, noticed on every flush and by periodic keepalives. *)
-let execute cfg server x ?principal req =
+   switch to an SSE stream scoped to this request. Each event waits for its
+   flush, so a peer that reads slowly holds back the handler instead of
+   growing the output buffer. The stream closing is the cancellation signal,
+   noticed on every flush and by periodic keepalives. *)
+let execute cfg server ~scope x ~headers ?principal req =
   let gone, set_gone = Eio.Promise.create () in
-  let mark_gone closed = if closed then ignore (Eio.Promise.try_resolve set_gone ()) in
+  let flush w = if w.flush () = `Closed then ignore (Eio.Promise.try_resolve set_gone ()) in
   Eio.Switch.run @@ fun sw ->
   let sse = ref None in
   let open_stream () =
     match !sse with
     | Some w -> w
     | None ->
-        let w = x.stream ~status:200 sse_headers in
+        let w = x.stream ~status:200 (headers @ sse_headers) in
         sse := Some w;
         Eio.Fiber.fork_daemon ~sw (fun () ->
             let rec beat () =
               Eio.Time.sleep cfg.clock cfg.keepalive;
               w.write ":\n\n";
-              w.flush mark_gone;
+              flush w;
               beat ()
             in
             beat ());
@@ -146,21 +172,37 @@ let execute cfg server x ?principal req =
     if not (Eio.Promise.is_resolved gone) then begin
       let w = open_stream () in
       event w wire;
-      w.flush mark_gone
+      flush w
     end
   in
   Eio.Fiber.first
     (fun () ->
-      let wire, status = Server.execute server ?principal ~emit req in
+      let wire, status = Server.execute server ?principal ~scope ~emit req in
       match !sse with
-      | None -> x.respond ~status json_headers wire
+      | None -> x.respond ~status (headers @ json_headers) wire
       | Some w ->
           event w wire;
           w.close ())
     (fun () -> Eio.Promise.await gone);
   Option.iter (fun w -> if Eio.Promise.is_resolved gone then w.close ()) !sse
 
-let post cfg server x =
+let dispatch cfg server ~scope x ?principal ?session body =
+  match Server.decode server ?session body with
+  | Server.Reject (id, e) -> reply x ?id e
+  | Ignore | Cancel _ -> x.respond ~status:202 [] []
+  | Request req -> (
+      (* Earlier revisions mirror nothing into headers. *)
+      let legacy = Server.Request.protocol_version req <> Proto.version in
+      match if legacy then Ok () else validate_headers x req with
+      | Error e -> reply x ~id:(Server.Request.id req) e
+      | Ok () ->
+          let headers =
+            Option.fold (Server.Request.session req) ~none:[] ~some:(fun s ->
+                [ ("mcp-session-id", session_id s) ])
+          in
+          execute cfg server ~scope x ~headers ?principal req)
+
+let post cfg server ~scope x =
   match Option.map cfg.allow_origin (x.header "origin") with
   | Some false ->
       x.respond ~status:403 json_headers (Wire.error (Error.invalid_request "Origin not allowed"))
@@ -173,13 +215,10 @@ let post cfg server x =
               x.respond ~status:413 json_headers
                 (Wire.error (Error.invalid_request "Request body too large"))
           | Some body -> (
-              match Server.decode server body with
-              | Server.Reject (id, e) -> reply x ?id e
-              | Ignore | Cancel _ -> x.respond ~status:202 [] []
-              | Request req -> (
-                  match validate_headers x req with
-                  | Error e -> reply x ~id:(Server.Request.id req) e
-                  | Ok () -> execute cfg server x ?principal req))))
+              match Option.map session_of_id (x.header "mcp-session-id") with
+              | Some None -> reply x (Error.invalid_request "Invalid Mcp-Session-Id")
+              | session ->
+                  dispatch cfg server ~scope x ?principal ?session:(Option.join session) body)))
 
 exception Connection_closed
 
@@ -194,7 +233,7 @@ let with_connection serve =
   with
   | () | (exception Connection_closed) -> ()
 
-let handle cfg server x =
+let handle cfg server ~scope x =
   match x.meth with
-  | "POST" -> post cfg server x
+  | "POST" -> post cfg server ~scope x
   | _ -> x.respond ~status:405 [ ("allow", "POST") ] []

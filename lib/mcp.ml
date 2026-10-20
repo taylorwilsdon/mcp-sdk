@@ -4,6 +4,7 @@
       {!Schema}.
     - Assemble them into a {!Server} and serve it with {!Stdio}, or over Streamable HTTP with the
       [mcp-sdk.http] library.
+    - Keep resources bound to a domain, such as connection pools, in {!Local} values.
     - Ask the client for more with {!Input} (multi round-trip requests) and read what came back
       through {!Ctx}.
     - Talk to servers with {!Client}. *)
@@ -15,6 +16,7 @@ module Wire = Wire
 module Proto = Proto
 module Schema = Schema
 module Input = Input
+module Local = Local
 module Ctx = Ctx
 module Tool = Tool
 module Resource = Resource

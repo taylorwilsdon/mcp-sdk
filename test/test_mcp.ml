@@ -270,7 +270,11 @@ let args =
     (name, count, tags, mode))
 
 let schema_tests =
-  let decode s = Json.decode (Schema.decoder args) s in
+  let decode s =
+    Result.bind
+      (Json.decode (Schema.decoder args) s)
+      (fun (convert, headers) -> Result.map (fun v -> (v, headers)) (convert ()))
+  in
   [
     Alcotest.test_case "json schema" `Quick (fun () ->
         let s = Json.to_string (Schema.json_schema args) in
@@ -346,13 +350,17 @@ let make_server ?page_size ?state_key () =
       ]
     ()
 
-let exchange server s =
+let exchange ?session server s =
   let notes = ref [] in
   let reply =
-    match Server.decode server s with
+    match Server.decode server ?session s with
     | Server.Request r ->
         let wire, _ =
-          Server.execute server ~emit:(fun w -> notes := Wire.to_string w :: !notes) r
+          Eio_mock.Backend.run @@ fun () ->
+          Eio.Switch.run @@ fun sw ->
+          Server.execute server ~scope:(Local.scope sw)
+            ~emit:(fun w -> notes := Wire.to_string w :: !notes)
+            r
         in
         Some (Wire.to_string wire)
     | Reject (id, e) -> Some (Wire.to_string (Wire.error ?id e))
@@ -360,7 +368,7 @@ let exchange server s =
   in
   (reply, List.rev !notes)
 
-let call server s = Option.get (fst (exchange server s))
+let call ?session server s = Option.get (fst (exchange ?session server s))
 
 let server_tests =
   let s = make_server () in
@@ -432,8 +440,8 @@ let server_tests =
           (str (get [ "error"; "data"; "requested" ] r)));
     Alcotest.test_case "unknown method" `Quick (fun () ->
         check_code (-32601) (call s (req "nope/nope" "")));
-    Alcotest.test_case "initialize" `Quick (fun () ->
-        check_code (-32601) (call s {|{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}|}));
+    Alcotest.test_case "initialize needs its parameters" `Quick (fun () ->
+        check_code (-32602) (call s {|{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}|}));
     Alcotest.test_case "removed ping" `Quick (fun () ->
         check_code (-32601) (call s (req "ping" "")));
     Alcotest.test_case "parse error" `Quick (fun () ->
@@ -713,6 +721,140 @@ let http_test =
         Eio.Switch.fail sw Exit
       with Exit -> ())
 
+(* Revisions 2025-11-25 and 2025-06-18 *)
+
+let initialize ?(caps = "{}") version =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"%s","capabilities":%s,"clientInfo":{"name":"old","version":"1"}}}|}
+    version caps
+
+let confirm_call =
+  {|{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"confirm","arguments":{"what":"x"}}}|}
+
+let accept id =
+  Printf.sprintf {|{"jsonrpc":"2.0","id":%s,"result":{"action":"accept","content":{"ok":true}}}|}
+    (Json.to_string (Option.get id))
+
+let text_of r =
+  str
+    ( Json.find_path [ "result"; "content" ] (parse r) |> function
+      | Some (Jsont.Array (c :: _, _)) -> Json.find "text" c
+      | _ -> None )
+
+let session_of s =
+  match Server.decode s (initialize "2025-11-25") with
+  | Server.Request r -> Server.Request.session r
+  | _ -> Alcotest.fail "initialize was not decoded"
+
+(* One POST to the HTTP endpoint, answered in memory. [on_flush] sees the
+   SSE stream so far each time an event is flushed. *)
+let post ~clock server ?session ?(on_flush = ignore) body =
+  let status = ref 0 and headers = ref [] and out = Buffer.create 256 in
+  let x : Mcp_http.Exchange.t =
+    {
+      meth = "POST";
+      header = (function "mcp-session-id" -> session | _ -> None);
+      read_body = (fun ~max:_ -> Some body);
+      respond =
+        (fun ~status:code h wire ->
+          status := code;
+          headers := h;
+          Buffer.add_string out (Wire.to_string wire));
+      stream =
+        (fun ~status:code h ->
+          status := code;
+          headers := h;
+          {
+            write = Buffer.add_string out;
+            flush =
+              (fun () ->
+                on_flush (Buffer.contents out);
+                `Written);
+            close = ignore;
+          });
+    }
+  in
+  Eio.Switch.run (fun sw ->
+      Mcp_http.handle (Mcp_http.config ~clock ()) server ~scope:(Local.scope sw) x);
+  (!status, List.assoc_opt "mcp-session-id" !headers, Buffer.contents out)
+
+let last_event stream =
+  let events = String.split_on_char '\n' stream in
+  List.fold_left
+    (fun last l ->
+      if String.starts_with ~prefix:"data: " l then String.sub l 6 (String.length l - 6) else last)
+    "" events
+
+let legacy_tests =
+  let s = make_server () in
+  [
+    Alcotest.test_case "initialize negotiates" `Quick (fun () ->
+        let version v = str (get [ "result"; "protocolVersion" ] (call s (initialize v))) in
+        Alcotest.(check string) "supported" "2025-06-18" (version "2025-06-18");
+        Alcotest.(check string) "latest otherwise" "2025-11-25" (version "2024-11-05");
+        let r = call s (initialize "2025-11-25") in
+        Alcotest.(check string)
+          "server info" "test"
+          (str (get [ "result"; "serverInfo"; "name" ] r));
+        Alcotest.(check bool)
+          "no list changes" true
+          (get [ "result"; "capabilities"; "tools"; "listChanged" ] r = None));
+    Alcotest.test_case "session stands in for _meta" `Quick (fun () ->
+        let session = session_of s in
+        ignore
+          (get [ "result"; "tools" ]
+             (call ?session s {|{"jsonrpc":"2.0","id":1,"method":"tools/list"}|}));
+        Alcotest.(check string)
+          "ping" "{}"
+          (Json.to_string
+             (Option.get
+                (get [ "result" ] (call ?session s {|{"jsonrpc":"2.0","id":1,"method":"ping"}|}))));
+        check_code (-32602) (call s {|{"jsonrpc":"2.0","id":1,"method":"tools/list"}|});
+        check_code (-32021) (call ?session s confirm_call));
+    Alcotest.test_case "stdio asks the client" `Quick
+      ( with_env @@ fun _ ->
+        Eio.Switch.run @@ fun sw ->
+        let c2s_r, c2s_w = Eio_unix.pipe sw and s2c_r, s2c_w = Eio_unix.pipe sw in
+        Eio.Fiber.both
+          (fun () ->
+            Stdio.serve (make_server ()) c2s_r s2c_w;
+            Eio.Resource.close s2c_w)
+          (fun () ->
+            let input = Eio.Buf_read.of_flow s2c_r ~max_size:1_000_000 in
+            let send s = Eio.Flow.copy_string (s ^ "\n") c2s_w in
+            send (initialize ~caps:{|{"elicitation":{}}|} "2025-11-25");
+            ignore (get [ "result"; "protocolVersion" ] (Eio.Buf_read.line input));
+            send {|{"jsonrpc":"2.0","method":"notifications/initialized"}|};
+            send confirm_call;
+            let ask = Eio.Buf_read.line input in
+            Alcotest.(check string) "asks" "elicitation/create" (str (get [ "method" ] ask));
+            send (accept (get [ "id" ] ask));
+            Alcotest.(check string) "answer" "confirmed x" (text_of (Eio.Buf_read.line input));
+            Eio.Resource.close c2s_w) );
+    Alcotest.test_case "http session" `Quick
+      ( with_env @@ fun env ->
+        let clock = Eio.Stdenv.clock env and server = make_server () in
+        let post = post ~clock server in
+        let status, session, _ = post (initialize ~caps:{|{"elicitation":{}}|} "2025-11-25") in
+        Alcotest.(check int) "initialized" 200 status;
+        Alcotest.(check bool) "session id" true (session <> None);
+        let _, _, r = post ?session {|{"jsonrpc":"2.0","id":1,"method":"tools/list"}|} in
+        ignore (get [ "result"; "tools" ] r);
+        let answered = ref false in
+        let on_flush stream =
+          let ask = last_event stream in
+          if (not !answered) && get [ "method" ] ask <> None then begin
+            answered := true;
+            let status, _, _ = post ?session (accept (get [ "id" ] ask)) in
+            Alcotest.(check int) "answer accepted" 202 status
+          end
+        in
+        let _, _, stream = post ?session ~on_flush confirm_call in
+        Alcotest.(check string) "answer" "confirmed x" (text_of (last_event stream));
+        let status, _, _ = post ~session:"%%" {|{"jsonrpc":"2.0","id":1,"method":"ping"}|} in
+        Alcotest.(check int) "bad session" 400 status );
+  ]
+
 (* Robustness *)
 
 let tool_info schema : Proto.Tool_info.t =
@@ -786,6 +928,7 @@ let () =
       ("schema", schema_tests);
       ("server", server_tests);
       ("mrtr", mrtr_tests);
+      ("legacy", legacy_tests);
       ("robustness", robustness_tests);
       ("regressions", Regression.tests);
       ( "e2e",

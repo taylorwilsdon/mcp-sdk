@@ -11,6 +11,10 @@ val result : Id.t -> string -> t
 
 val error : ?id:Id.t -> Error.t -> t
 val notification : string -> string -> t
+
+val request : Id.t -> string -> string -> t
+(** A request from the server, as earlier revisions use for elicitation and sampling. *)
+
 val iter : (string -> unit) -> t -> unit
 val length : t -> int
 val to_string : t -> string

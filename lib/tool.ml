@@ -18,18 +18,25 @@ let case t = t.case
 
 let v ?title ?description ?annotations ?(icons = []) ?output_schema ?meta name schema handler =
   let decoder = Schema.decoder schema in
+  (* Arguments are converted when the call executes, not as it is decoded. *)
+  let call convert headers =
+    let run ctx =
+      match convert () with
+      | Ok args -> handler ctx args
+      | Error msg -> Error (Error.invalid_params msg)
+    in
+    { name; run; headers }
+  in
   (* An absent [arguments] member means the empty object. *)
-  let empty () =
+  let empty =
     match Json.decode decoder "{}" with
-    | Ok (args, _) -> { name; run = (fun ctx -> handler ctx args); headers = [] }
+    | Ok (convert, _) -> call convert []
     | Error e -> { name; run = (fun _ -> Error (Error.invalid_params e)); headers = [] }
   in
   let call =
     O.map
       ~kind:("tools/call " ^ name ^ " params")
-      (function
-        | Some (args, headers) -> { name; run = (fun ctx -> handler ctx args); headers }
-        | None -> empty ())
+      (function Some (convert, headers) -> call convert headers | None -> empty)
     |> O.opt_mem "arguments" decoder |> O.finish
   in
   let info : Proto.Tool_info.t =

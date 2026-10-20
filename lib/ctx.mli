@@ -16,9 +16,13 @@ val principal : t -> string option
 val meta : t -> string -> Json.t option
 (** Any other [_meta] key of the request, e.g. ["traceparent"]. *)
 
+val local : t -> 'a Local.t -> 'a
+(** The value of a {!Local.t} on the domain serving this request. *)
+
 val progress : t -> ?total:float -> ?message:string -> float -> unit
 (** Report progress if the client asked for it. Values that do not increase are dropped, as the
-    protocol requires. *)
+    protocol requires. Like every message a handler emits, it may wait until the transport has
+    passed earlier messages on to the client. *)
 
 val state : t -> string option
 (** The verified [requestState] of a retried request. *)
@@ -41,6 +45,7 @@ val make :
   state:string option ->
   principal:string option ->
   emit:(Wire.t -> unit) ->
+  scope:Local.scope ->
   t
 
 val emit : t -> Wire.t -> unit

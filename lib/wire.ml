@@ -13,6 +13,9 @@ let error ?id e =
 let notification method_ params =
   [ "{\"jsonrpc\":\"2.0\",\"method\":"; Json.quote method_; ",\"params\":"; params; "}" ]
 
+let request id method_ params =
+  [ result_head; Id.to_wire id; ",\"method\":"; Json.quote method_; ",\"params\":"; params; "}" ]
+
 let iter = List.iter
 let length t = List.fold_left (fun n s -> n + String.length s) 0 t
 let to_string t = String.concat "" t
