@@ -10,17 +10,27 @@ let echo =
       message)
     (fun _ctx message -> Ok (Tool.text message))
 
+(* A typed result: the advertised outputSchema and the encoded value come
+   from one definition. *)
+let sum =
+  Tool.output
+    ~schema:
+      (Json.obj
+         [
+           ("type", Json.str "object");
+           ("properties", Json.obj [ ("sum", Json.obj [ ("type", Json.str "integer") ]) ]);
+           ("required", Json.list [ Json.str "sum" ]);
+         ])
+    Jsont.Object.(map Fun.id |> mem "sum" Jsont.int ~enc:Fun.id |> finish)
+
 let add =
-  Tool.v "add" ~description:"Add two integers"
+  Tool.v "add" ~description:"Add two integers" ~output:sum
     ~annotations:(Proto.Tool_annotations.v ~read_only:true ())
     Schema.(
       let+ a = req "a" int and+ b = req "b" int in
       (a, b))
     (fun _ctx (a, b) ->
-      Ok
-        (Tool.structured
-           ~content:[ Proto.Content.text (string_of_int (a + b)) ]
-           (Json.obj [ ("sum", Json.int (a + b)) ])))
+      Ok (Tool.return sum ~content:[ Proto.Content.text (string_of_int (a + b)) ] (a + b)))
 
 let countdown clock =
   Tool.v "countdown" ~description:"Count down, reporting progress"

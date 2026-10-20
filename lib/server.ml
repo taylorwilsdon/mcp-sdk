@@ -46,6 +46,7 @@ type listing_pages = { generation : string; bodies : string array }
 
 type pages = {
   tool_pages : listing_pages;
+  legacy_tool_pages : listing_pages;  (** As earlier revisions see them, see {!Tool.legacy_info}. *)
   resource_pages : listing_pages;
   template_pages : listing_pages;
   prompt_pages : listing_pages;
@@ -73,12 +74,16 @@ type config = {
   list_scope : Proto.cache_scope;
   state_key : string;
   state_ttl_ms : int;
+  on_exception : exn -> Printexc.raw_backtrace -> unit;
 }
 
 (* Subscription hub: monotonically increasing change counters. Listeners
    compare against the last values they saw, so producers never block and
-   bursts of changes coalesce into one notification per listener. *)
-type hub = { tools_v : int; prompts_v : int; resources_v : int; uris : int Smap.t; closed : bool }
+   bursts of changes coalesce into one notification per listener. Only URIs
+   some listener watches are counted, so the hub stays as large as the
+   subscriptions open at once. *)
+type watch = { listeners : int; version : int }
+type hub = { tools_v : int; prompts_v : int; resources_v : int; uris : watch Smap.t; closed : bool }
 
 (* Requests put to clients of earlier revisions, awaiting their answers. *)
 type pending = (Json.t, Error.t) result Eio.Promise.u Smap.t
@@ -301,6 +306,9 @@ let build cfg reg =
       meta = Some cfg.server_meta;
     }
   in
+  let tool_pages = pages cfg ~key:"tools" Proto.Tool_info.codec in
+  let tools = List.map Tool.info reg.tools and legacy_tools = List.map Tool.legacy_info reg.tools in
+  let modern_pages = tool_pages tools in
   {
     reg;
     resource_map = Smap.of_list (List.map (fun r -> (Resource.uri r, r)) reg.resources);
@@ -308,7 +316,9 @@ let build cfg reg =
     capabilities;
     pages =
       {
-        tool_pages = pages cfg ~key:"tools" Proto.Tool_info.codec (List.map Tool.info reg.tools);
+        tool_pages = modern_pages;
+        legacy_tool_pages =
+          (if List.for_all2 ( == ) tools legacy_tools then modern_pages else tool_pages legacy_tools);
         resource_pages =
           pages cfg ~key:"resources" Proto.Resource.codec (List.map Resource.info reg.resources);
         template_pages =
@@ -322,9 +332,13 @@ let build cfg reg =
     codec = envelope_codec methods;
   }
 
+let report_exception e bt =
+  Printf.eprintf "mcp: handler raised %s\n%s%!" (Printexc.to_string e)
+    (Printexc.raw_backtrace_to_string bt)
+
 let v ?title ?description ?website_url ?(icons = []) ?instructions ?extensions ?tools ?resources
     ?templates ?prompts ?page_size ?(list_ttl_ms = 60_000) ?(list_scope = Proto.Public) ?state_key
-    ?(state_ttl_ms = 600_000) ~name ~version () =
+    ?(state_ttl_ms = 600_000) ?(on_exception = report_exception) ~name ~version () =
   if Option.fold page_size ~none:false ~some:(fun n -> n <= 0) then
     invalid_arg "Server.v: page_size must be positive";
   let info = Proto.Implementation.v ?title ?description ?website_url ~icons ~version name in
@@ -342,6 +356,7 @@ let v ?title ?description ?website_url ?(icons = []) ?instructions ?extensions ?
       list_scope;
       state_key = (match state_key with Some k -> k | None -> State.random_key ());
       state_ttl_ms;
+      on_exception;
     }
   in
   let some = Option.value ~default:[] in
@@ -375,7 +390,9 @@ let info t = t.cfg.info
 
 let rec update_hub t f =
   let h = Atomic.get t.hub in
-  if Atomic.compare_and_set t.hub h (f h) then Eio.Condition.broadcast t.changed else update_hub t f
+  let h' = f h in
+  if not (Atomic.compare_and_set t.hub h h') then update_hub t f
+  else if h' != h then Eio.Condition.broadcast t.changed
 
 let rec update t f =
   let s = Atomic.get t.snapshot in
@@ -408,8 +425,23 @@ let set_resources t ?templates resources =
 
 let resource_updated t uri =
   update_hub t (fun h ->
-      { h with uris = Smap.update uri (fun v -> Some (1 + Option.value v ~default:0)) h.uris })
+      match Smap.find_opt uri h.uris with
+      | None -> h
+      | Some w -> { h with uris = Smap.add uri { w with version = w.version + 1 } h.uris })
 
+(* Add or drop one listener of each URI, forgetting URIs nobody watches. *)
+let watch t uris n =
+  let step m uri =
+    Smap.update uri
+      (fun w ->
+        match Option.value w ~default:{ listeners = 0; version = 0 } with
+        | { listeners; _ } when listeners + n <= 0 -> None
+        | w -> Some { w with listeners = w.listeners + n })
+      m
+  in
+  if uris <> [] then update_hub t (fun h -> { h with uris = List.fold_left step h.uris uris })
+
+let watched_uris t = Smap.cardinal (Atomic.get t.hub).uris
 let shutdown t = update_hub t (fun h -> { h with closed = true })
 
 (* Decoding *)
@@ -459,6 +491,10 @@ let classify t snap ?session s msg =
       Reject (Some id, Error.method_not_found m)
   | Ok (Some id, Some _, Some v, _) when not (List.mem v supported_versions) ->
       Reject (Some id, Error.unsupported_version ~supported:supported_versions ~requested:v)
+  | Ok (Some id, Some ("initialize" as m), Some _, _) ->
+      (* 2026-07-28 removed [initialize]; only earlier revisions, which send
+         no [_meta] version, may open a session. *)
+      Reject (Some id, Error.method_not_found m)
   | Ok (Some id, Some m, None, _) when Option.is_none session && m <> "initialize" ->
       Reject (Some id, missing_meta)
   | Ok (Some id, Some _, _, _) -> Reject (Some id, Error.invalid_params msg)
@@ -512,11 +548,16 @@ end
 
 (* Execution *)
 
-let guard f =
+(* An exception is reported to the server's hook, never to the client, as
+   its text can carry anything the handler had in hand. *)
+let guard cfg f =
   match f () with
   | r -> r
   | exception (Eio.Cancel.Cancelled _ as e) -> raise e
-  | exception e -> Error (Error.internal_error (Printexc.to_string e))
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      (try cfg.on_exception e bt with Eio.Cancel.Cancelled _ as e -> raise e | _ -> ());
+      Error (Error.internal_error "Internal error")
 
 let with_server_info cfg = function
   | Some (Jsont.Object (mems, m)) -> Some (Jsont.Object (cfg.server_info :: mems, m))
@@ -538,18 +579,25 @@ let rec swap a f =
   let v = Atomic.get a in
   if not (Atomic.compare_and_set a v (f v)) then swap a f
 
+(* 2025-11-25 identifies a URL elicitation with an [elicitationId], which
+   2026-07-28 leaves out. *)
+let legacy_params ~id (q : Input.request) =
+  match (q.method_, Json.find "mode" q.params, Json.find "elicitationId" q.params) with
+  | "elicitation/create", Some (Jsont.String ("url", _)), None ->
+      Json.obj (Json.mems q.params @ [ ("elicitationId", Json.str id) ])
+  | _ -> q.params
+
 (* Put an input request to a client of an earlier revision as a request of
    its own, on the stream of the request that needs it. Ids are MACs of a
    counter, so no client can guess another's and answer in its place. *)
 let ask t emit (key, (q : Input.request)) =
   let n = Atomic.fetch_and_add t.asked 1 in
-  let id =
-    Id.String Digestif.SHA256.(to_hex (hmac_string ~key:t.cfg.state_key (string_of_int n)))
-  in
+  let mac = Digestif.SHA256.(to_hex (hmac_string ~key:t.cfg.state_key (string_of_int n))) in
+  let id = Id.String mac in
   let answered, resolver = Eio.Promise.create () in
   swap t.pending (Smap.add (Id.to_wire id) resolver);
   Fun.protect ~finally:(fun () -> swap t.pending (Smap.remove (Id.to_wire id))) @@ fun () ->
-  emit (Wire.request id q.method_ (Json.to_string q.params));
+  emit (Wire.request id q.method_ (Json.to_string (legacy_params ~id:mac q)));
   match Eio.Promise.await answered with
   | Ok answer -> Ok (key, answer)
   | Error (e : Error.t) -> Error (Error.internal_error (q.method_ ^ " failed: " ^ e.message))
@@ -586,12 +634,15 @@ let listen t ctx (filter : Proto.Filter.t) =
   let sub = Id.to_wire (Ctx.id ctx) in
   let note = subscription_note sub in
   let emit = Ctx.emit ctx in
-  (* Take the baseline before acknowledging so no change can fall between. *)
+  (* Watch the URIs and take the baseline before acknowledging, so no change
+     can fall between. *)
+  watch t accepted.uris 1;
+  Fun.protect ~finally:(fun () -> watch t accepted.uris (-1)) @@ fun () ->
   let seen = ref (Atomic.get t.hub) in
   emit
     (note "notifications/subscriptions/acknowledged"
        (",\"notifications\":" ^ Json.encode Proto.Filter.codec accepted));
-  let uri_v h uri = Smap.find_opt uri h.uris in
+  let uri_v h uri = Option.map (fun w -> w.version) (Smap.find_opt uri h.uris) in
   Eio.Condition.loop_no_mutex t.changed (fun () ->
       let h = Atomic.get t.hub and s = !seen in
       seen := h;
@@ -635,7 +686,7 @@ let complete cfg snap ref_ arg value context =
            (Proto.Completion.v ~total ~has_more:(total > 100) shown, Some cfg.server_meta))
 
 let run t snap ctx ~required op =
-  let cfg = t.cfg in
+  let cfg = t.cfg and legacy = Ctx.protocol_version ctx <> Proto.version in
   let step codec with_meta f = step ctx ~required codec with_meta (f ()) in
   match op with
   | Initialize ->
@@ -649,13 +700,15 @@ let run t snap ctx ~required op =
            })
   | Ping -> Ok "{}"
   | Discover -> Ok snap.discover
-  | List_tools c -> page snap.pages.tool_pages c
+  | List_tools c -> page (if legacy then snap.pages.legacy_tool_pages else snap.pages.tool_pages) c
   | List_resources c -> page snap.pages.resource_pages c
   | List_templates c -> page snap.pages.template_pages c
   | List_prompts c -> page snap.pages.prompt_pages c
   | Call c ->
       step Proto.Call_result.codec
-        (fun (r : Proto.Call_result.t) -> { r with meta = with_server_info cfg r.meta })
+        (fun (r : Proto.Call_result.t) ->
+          let r = if legacy then c.legacy r else r in
+          { r with meta = with_server_info cfg r.meta })
         (fun () -> c.run ctx)
   | Read uri -> (
       let read_meta (r : Proto.Read_result.t) = { r with meta = with_server_info cfg r.meta } in
@@ -713,7 +766,7 @@ let execute t ?principal ~scope ~emit req =
       if p.meta.protocol_version = Proto.version then seal r
       else Result.bind (ask_all t emit r.requests) (fun inputs -> attempt ~inputs ~state:r.state)
     in
-    guard (fun () -> run t req.snap ctx ~required p.op)
+    guard cfg (fun () -> run t req.snap ctx ~required p.op)
   in
   let verified =
     match p.state with

@@ -2,3 +2,6 @@
  (name mcp)
  (public_name mcp-sdk)
  (libraries jsont jsont.bytesrw bytesrw eio digestif.c base64 unix))
+
+(documentation
+ (package mcp-sdk))

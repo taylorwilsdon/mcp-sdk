@@ -22,3 +22,6 @@ bisect*.coverage
 
 # macOS
 .DS_Store
+
+# Conformance runs (examples/conformance/run.sh)
+_conformance/

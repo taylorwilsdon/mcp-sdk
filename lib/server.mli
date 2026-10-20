@@ -40,6 +40,7 @@ val v :
   ?list_scope:Proto.cache_scope ->
   ?state_key:string ->
   ?state_ttl_ms:int ->
+  ?on_exception:(exn -> Printexc.raw_backtrace -> unit) ->
   name:string ->
   version:string ->
   unit ->
@@ -55,7 +56,10 @@ val v :
     - [state_key] is the MRTR [requestState] HMAC key. It defaults to a random key, so set it when
       several processes serve the same clients. State is bound to the method, target, principal and
       original arguments. Object member ordering may change on retry; argument values may not.
-    - [state_ttl_ms] is how long sealed state stays valid (default: 10min). *)
+    - [state_ttl_ms] is how long sealed state stays valid (default: 10min).
+    - [on_exception] receives an exception a handler raised, with its backtrace (default: print both
+      to stderr). The client only sees a generic [-32603] "Internal error", since the exception's
+      text may carry anything the handler had in hand. *)
 
 val info : t -> Proto.Implementation.t
 
@@ -70,7 +74,9 @@ val set_prompts : t -> Prompt.t list -> unit
 val set_resources : t -> ?templates:Resource.template list -> Resource.t list -> unit
 
 val resource_updated : t -> string -> unit
-(** Notify subscribers of a resource URI that it changed. *)
+(** Notify subscribers of a resource URI that it changed. Only URIs that an open
+    [subscriptions/listen] stream watches are tracked, so updating others costs nothing and the
+    server keeps no history of them. *)
 
 val shutdown : t -> unit
 (** End every subscription stream gracefully. *)
@@ -119,3 +125,8 @@ module Request : sig
 
   val header_args : t -> Schema.header list
 end
+
+(**/**)
+
+val watched_uris : t -> int
+(** The number of resource URIs open subscriptions watch, for tests. *)

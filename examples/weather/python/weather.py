@@ -167,6 +167,11 @@ def main() -> None:
         metavar="PORT",
         help="serve Streamable HTTP on 127.0.0.1:PORT instead of stdio",
     )
+    parser.add_argument(
+        "--no-access-log",
+        action="store_true",
+        help="turn off uvicorn's per-request access log (on by default)",
+    )
     args = parser.parse_args()
 
     if args.http is None:
@@ -180,6 +185,7 @@ def main() -> None:
             path="/mcp",
             stateless_http=True,
             json_response=True,
+            uvicorn_config={"access_log": not args.no_access_log},
         )
 
 

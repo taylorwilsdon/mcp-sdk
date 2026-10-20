@@ -1,7 +1,8 @@
 (* The fixtures that the official conformance suite
    (@modelcontextprotocol/conformance) expects of a server, served over
-   Streamable HTTP. The suite speaks 2025-11-25, so every scenario goes
-   through the initialize handshake. *)
+   Streamable HTTP. One endpoint serves both revisions the suite measures:
+   2025-11-25 through the initialize handshake, and 2026-07-28 statelessly.
+   Handlers are written once, for MRTR. *)
 
 open Mcp
 
@@ -27,14 +28,48 @@ let asking name description args request ~reply =
       | Some answer -> Ok (Tool.text (reply ^ Json.to_string answer))
       | None -> Ok (Input.required [ ("answer", request a) ]))
 
-let elicit message properties =
+let elicit ?(required = []) message properties =
   Input.raw ~method_:"elicitation/create"
     (Json.obj
        [
          ("message", Json.str message);
          ( "requestedSchema",
-           Json.obj [ ("type", Json.str "object"); ("properties", json properties) ] );
+           Json.obj
+             (("type", Json.str "object")
+             :: ("properties", json properties)
+             ::
+             (if required = [] then [] else [ ("required", Json.list (List.map Json.str required)) ])
+             ) );
        ])
+
+let sample ?(max_tokens = 100) text =
+  Input.raw ~method_:"sampling/createMessage"
+    (Json.obj
+       [
+         ( "messages",
+           Json.list
+             [
+               Json.obj
+                 [
+                   ("role", Json.str "user");
+                   ("content", Json.obj [ ("type", Json.str "text"); ("text", Json.str text) ]);
+                 ];
+             ] );
+         ("maxTokens", Json.int max_tokens);
+       ])
+
+let roots = Input.raw ~method_:"roots/list" Json.empty
+
+let ask_string key message =
+  elicit ~required:[ key ] message (Printf.sprintf {|{%S:{"type":"string"}}|} key)
+
+(* A string the client gave in answer to [key], at [path] in its answer. *)
+let answered ctx key path =
+  match Option.bind (Ctx.input ctx key) (Json.find_path path) with
+  | Some (Jsont.String (s, _)) -> Some s
+  | _ -> None
+
+let has ctx key = Ctx.input ctx key <> None
 
 let progress clock =
   Tool.v "test_tool_with_progress" ~description:"Reports progress" Schema.empty (fun ctx () ->
@@ -65,23 +100,7 @@ let tools clock =
     progress clock;
     asking "test_sampling" "Asks the client's model"
       Schema.(req "prompt" string)
-      (fun prompt ->
-        Input.raw ~method_:"sampling/createMessage"
-          (Json.obj
-             [
-               ( "messages",
-                 Json.list
-                   [
-                     Json.obj
-                       [
-                         ("role", Json.str "user");
-                         ( "content",
-                           Json.obj [ ("type", Json.str "text"); ("text", Json.str prompt) ] );
-                       ];
-                   ] );
-               ("maxTokens", Json.int 100);
-             ]))
-      ~reply:"LLM response: ";
+      sample ~reply:"LLM response: ";
     asking "test_elicitation" "Asks the user"
       Schema.(req "message" string)
       (fun message ->
@@ -153,6 +172,14 @@ let prompts =
                  (embedded (List.assoc "resourceUri" args) "Embedded resource content for testing.");
                user_text "Please process the embedded resource above.";
              ]));
+    Prompt.v "test_input_required_result_prompt" ~description:"A prompt that needs context"
+      (fun ctx _ ->
+        match answered ctx "user_context" [ "content"; "context" ] with
+        | Some context -> Ok (Prompt.messages [ user_text ("Use this context: " ^ context) ])
+        | None ->
+            Ok
+              (Input.required
+                 [ ("user_context", ask_string "context" "What context should the prompt use?") ]));
     Prompt.v "test_prompt_with_image" ~description:"A prompt with an image" (fun _ _ ->
         Ok
           (Prompt.messages
@@ -162,6 +189,96 @@ let prompts =
              ]));
   ]
 
+(* 2026-07-28 MRTR fixtures. *)
+let input_required server =
+  let tool name description f = Tool.v name ~description Schema.empty (fun ctx () -> Ok (f ctx)) in
+  [
+    tool "test_input_required_result_elicitation" "Asks the user's name" (fun ctx ->
+        match answered ctx "user_name" [ "content"; "name" ] with
+        | Some name -> Tool.text ("Hello, " ^ name ^ "!")
+        | None -> Input.required [ ("user_name", ask_string "name" "What is your name?") ]);
+    tool "test_input_required_result_sampling" "Asks the client's model" (fun ctx ->
+        match answered ctx "capital_question" [ "content"; "text" ] with
+        | Some text -> Tool.text ("Sampling response: " ^ text)
+        | None -> Input.required [ ("capital_question", sample "What is the capital of France?") ]);
+    tool "test_input_required_result_list_roots" "Asks for the client's roots" (fun ctx ->
+        match Ctx.input ctx "client_roots" with
+        | Some r -> Tool.text ("Client roots: " ^ Json.to_string r)
+        | None -> Input.required [ ("client_roots", roots) ]);
+    tool "test_input_required_result_request_state" "Carries state across a confirmation"
+      (fun ctx ->
+        match Ctx.state ctx with
+        | Some "awaiting-confirm" when has ctx "confirm" -> Tool.text "state-ok: confirmed"
+        | _ ->
+            Input.required ~state:"awaiting-confirm"
+              [
+                ("confirm", elicit ~required:[ "ok" ] "Please confirm" {|{"ok":{"type":"boolean"}}|});
+              ]);
+    tool "test_input_required_result_multiple_inputs" "Asks for several inputs at once" (fun ctx ->
+        if
+          Ctx.state ctx = Some "multiple"
+          && List.for_all (has ctx) [ "user_name"; "greeting"; "client_roots" ]
+        then Tool.text "All inputs received"
+        else
+          Input.required ~state:"multiple"
+            [
+              ("user_name", ask_string "name" "What is your name?");
+              ("greeting", sample ~max_tokens:50 "Generate a greeting");
+              ("client_roots", roots);
+            ]);
+    tool "test_input_required_result_multi_round" "Asks in two rounds" (fun ctx ->
+        match (Ctx.state ctx, answered ctx "step1" [ "content"; "name" ]) with
+        | Some "round-2", _ when has ctx "step2" -> Tool.text "Both rounds complete"
+        | Some "round-1", Some _ | Some "round-2", _ ->
+            Input.required ~state:"round-2"
+              [ ("step2", ask_string "color" "Step 2: What is your favorite color?") ]
+        | _ ->
+            Input.required ~state:"round-1"
+              [ ("step1", ask_string "name" "Step 1: What is your name?") ]);
+    tool "test_input_required_result_tampered_state" "Rejects tampered state" (fun ctx ->
+        match Ctx.state ctx with
+        | Some _ -> Tool.text "State verified"
+        | None ->
+            Input.required ~state:"integrity-protected" [ ("confirm", ask_string "ok" "Continue?") ]);
+    (* Only ask for what the client can answer. *)
+    tool "test_input_required_result_capabilities" "Asks only what the client can answer"
+      (fun ctx ->
+        let caps = Ctx.client_caps ctx in
+        match
+          List.filter_map Fun.id
+            [
+              (if caps.sampling then Some ("question", sample "Say hello") else None);
+              (if caps.elicit_form then Some ("user_name", ask_string "name" "What is your name?")
+               else None);
+            ]
+        with
+        | requests when List.exists (fun (k, _) -> not (has ctx k)) requests ->
+            Input.required requests
+        | _ -> Tool.text "Answered with the declared capabilities");
+    (* Needs sampling, so a client that has not declared it gets -32021. *)
+    tool "test_missing_capability" "Needs sampling" (fun ctx ->
+        if has ctx "question" then Tool.text "Sampled"
+        else Input.required [ ("question", sample "Hi") ]);
+    tool "test_streaming_elicitation" "Elicits through MRTR" (fun ctx ->
+        if has ctx "user_name" then Tool.text "Elicited"
+        else Input.required [ ("user_name", ask_string "name" "What is your name?") ]);
+    (* This server never logs, so it never logs without a requested level. *)
+    tool "test_logging_tool" "Never logs" (fun _ -> Tool.text "No log messages");
+    tool "test_trigger_tool_change" "Changes the tool list" (fun _ ->
+        Server.add_tool (Lazy.force server) (fixed "test_dynamic_tool" "Added at run time" []);
+        Tool.text "Tool list changed");
+    tool "test_trigger_prompt_change" "Changes the prompt list" (fun _ ->
+        let s = Lazy.force server in
+        Server.set_prompts s
+          (Prompt.v "test_dynamic_prompt" ~description:"Added at run time" (fun _ _ ->
+               Ok (Prompt.messages []))
+          :: prompts);
+        Tool.text "Prompt list changed");
+    Tool.v "test_headers" ~description:"Mirrors its region into a header"
+      Schema.(req "region" string ~header:"Region")
+      (fun _ region -> Ok (Tool.text ("Region: " ^ region)));
+  ]
+
 let () =
   let port = ref 3000 in
   Arg.parse
@@ -169,6 +286,10 @@ let () =
     ignore "conformance [--port PORT]";
   Eio_main.run @@ fun env ->
   let clock = Eio.Stdenv.clock env and net = Eio.Stdenv.net env in
-  Mcp_http.serve ~net ~clock ~port:!port
-    (Server.v ~name:"conformance" ~version:"1.0.0" ~tools:(tools clock) ~resources ~templates
-       ~prompts ())
+  let rec server =
+    lazy
+      (Server.v ~name:"conformance" ~version:"1.0.0"
+         ~tools:(tools clock @ input_required server)
+         ~resources ~templates ~prompts ())
+  in
+  Mcp_http.serve ~net ~clock ~port:!port (Lazy.force server)

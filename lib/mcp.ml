@@ -7,7 +7,10 @@
     - Keep resources bound to a domain, such as connection pools, in {!Local} values.
     - Ask the client for more with {!Input} (multi round-trip requests) and read what came back
       through {!Ctx}.
-    - Talk to servers with {!Client}. *)
+    - Talk to servers with {!Client}.
+
+    Clients and servers of revisions 2025-11-25 and 2025-06-18 are served and reached with the same
+    handlers; see {!Server} and {!Client.connect}. *)
 
 module Json = Json
 module Id = Id

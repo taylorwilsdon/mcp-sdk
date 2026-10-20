@@ -1,0 +1,29 @@
+# Scenarios required by revision 2026-07-28 that this SDK does not pass.
+client:
+  # The client has no OAuth flow; Mcp_http.Client.v ~headers carries a bearer
+  # token obtained elsewhere.
+  - auth/metadata-default
+  - auth/metadata-var1
+  - auth/metadata-var2
+  - auth/metadata-var3
+  - auth/basic-cimd
+  - auth/scope-from-www-authenticate
+  - auth/scope-from-scopes-supported
+  - auth/scope-omitted-when-undefined
+  - auth/scope-step-up
+  - auth/scope-retry-limit
+  - auth/token-endpoint-auth-basic
+  - auth/token-endpoint-auth-post
+  - auth/token-endpoint-auth-none
+  - auth/pre-registration
+  - auth/resource-mismatch
+  - auth/offline-access-scope
+  - auth/offline-access-not-supported
+  - auth/authorization-server-migration
+  - auth/iss-supported
+  - auth/iss-not-advertised
+  - auth/iss-supported-missing
+  - auth/iss-wrong-issuer
+  - auth/iss-unexpected
+  - auth/iss-normalized
+  - auth/metadata-issuer-mismatch

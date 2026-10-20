@@ -98,6 +98,8 @@ module Client : sig
     ?path:string ->
     ?connections:int ->
     ?max_queued:int ->
+    ?max_response:int ->
+    ?headers:(unit -> (string * string) list) ->
     authority:string ->
     (Eio.Switch.t -> _ Eio.Net.stream_socket) ->
     Mcp.Client.transport
@@ -106,7 +108,17 @@ module Client : sig
       the server: resolving a host name, a Unix domain socket, a proxy, socket options. [authority]
       is the [Host] header and [path] the endpoint (default ["/mcp"]). Cancelling a request drops
       its connection. [max_queued] bounds each request's queue of notifications (default 4MiB), as
-      {!Mcp.Client.transport} describes. *)
+      {!type:Mcp.Client.transport} describes.
+
+      [max_response] bounds what a response may make the client hold at once (default 4MiB): a JSON
+      body, or one SSE event. A response past it fails the request and drops its connection.
+      [headers] is called for each request and its headers are added, e.g. a bearer token
+      [("authorization", "Bearer " ^ token)] that may change between requests.
+
+      With a server of an earlier revision, the transport echoes the [Mcp-Session-Id] it issued and
+      opens a GET stream for the requests that server sends outside a request's own stream, unless
+      the server refuses it. A stream the server ends is reopened by the next response that carries
+      the session. *)
 
   val http1 :
     sw:Eio.Switch.t ->
@@ -115,6 +127,8 @@ module Client : sig
     ?path:string ->
     ?connections:int ->
     ?max_queued:int ->
+    ?max_response:int ->
+    ?headers:(unit -> (string * string) list) ->
     port:int ->
     unit ->
     Mcp.Client.transport

@@ -1,0 +1,16 @@
+{0 mcp-sdk}
+
+A Model Context Protocol SDK for OCaml 5 and Eio. Servers speak revision 2026-07-28 and serve
+clients of 2025-11-25 and 2025-06-18 with the same handlers; clients speak any of the three.
+
+{1 Libraries}
+
+- {!Mcp} ([mcp-sdk]): protocol types and codecs, {!Mcp.Schema}, {!Mcp.Tool}, {!Mcp.Resource},
+  {!Mcp.Prompt}, {!Mcp.Server}, the stdio transport {!Mcp.Stdio} and {!Mcp.Client}.
+- {!Mcp_http} ([mcp-sdk.http]): Streamable HTTP server and client transports over HTTP/1.1.
+
+{1 Where to start}
+
+- A server: {!Mcp.Tool.v} and {!Mcp.Server.v}, then {!Mcp.Stdio.run} or {!Mcp_http.serve}.
+- A client: {!Mcp.Client.connect} over {!Mcp.Client.line_transport} or {!Mcp_http.Client.http1}.
+- Multi round-trip requests: {!Mcp.Input} and {!Mcp.Ctx}.

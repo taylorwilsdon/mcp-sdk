@@ -150,10 +150,25 @@ let exceptions () =
   check_error (-32603) (execute s (request "completion/complete" completion_params));
   check_success (execute s (call "convert" (parse {|{"n":"42"}|}) []))
 
+let exception_reporting () =
+  let reported = ref [] in
+  let leak = Tool.v "leak" Schema.empty (fun _ () -> failwith "password=hunter2") in
+  let s =
+    Server.v ~name:"t" ~version:"1" ~tools:[ leak ]
+      ~on_exception:(fun e _ -> reported := Printexc.to_string e :: !reported)
+      ()
+  in
+  let response = execute s (call "leak" Json.empty []) in
+  check_error (-32603) response;
+  Alcotest.(check string)
+    "generic message" "Internal error"
+    (string (field [ "error"; "message" ] response));
+  Alcotest.(check (list string)) "reported" [ "Failure(\"password=hunter2\")" ] !reported
+
 let response_envelopes () =
   List.iter
     (fun raw ->
-      let client = Client.connect { send = (fun ~headers:_ ~id:_ _ ~on_note:_ -> raw) } in
+      let client = Client.connect (Client.transport (fun ~headers:_ ~id:_ _ ~on_note:_ -> raw)) in
       local (Client.call_tool client "t" Json.empty))
     [
       {|{"jsonrpc":"1.0","id":1,"result":{"content":[]}}|};
@@ -166,20 +181,15 @@ let response_envelopes () =
     ];
   let client =
     Client.connect
-      {
-        send =
-          (fun ~headers:_ ~id _ ~on_note:_ -> Wire.to_string (Wire.result id {|{"content":[]}|}));
-      }
+      (Client.transport (fun ~headers:_ ~id _ ~on_note:_ ->
+           Wire.to_string (Wire.result id {|{"content":[]}|})))
   in
   ignore (ok (Client.call_tool client "t" Json.empty));
   ignore (ok (Client.call_tool client "t" Json.empty));
   let client =
     Client.connect
-      {
-        send =
-          (fun ~headers:_ ~id _ ~on_note:_ ->
-            Wire.to_string (Wire.error ~id (Error.invalid_params "bad")));
-      }
+      (Client.transport (fun ~headers:_ ~id _ ~on_note:_ ->
+           Wire.to_string (Wire.error ~id (Error.invalid_params "bad"))))
   in
   match Client.call_tool client "t" Json.empty with
   | Error (Client.Remote e) -> Alcotest.(check int) "remote error preserved" (-32602) e.code
@@ -189,16 +199,13 @@ let invalidation () =
   let sends = ref 0 and client_ref = ref None in
   let s = server [ tool "old" ] in
   let transport : Client.transport =
-    {
-      send =
-        (fun ~headers:_ ~id:_ raw ~on_note:_ ->
-          incr sends;
-          let response = execute s raw in
-          if !sends = 1 then (
-            Server.set_tools s [ tool "new" ];
-            Client.invalidate (Option.get !client_ref) "tools/list");
-          Json.to_string response);
-    }
+    Client.transport (fun ~headers:_ ~id:_ raw ~on_note:_ ->
+        incr sends;
+        let response = execute s raw in
+        if !sends = 1 then (
+          Server.set_tools s [ tool "new" ];
+          Client.invalidate (Option.get !client_ref) "tools/list");
+        Json.to_string response)
   in
   let client = Client.connect transport in
   client_ref := Some client;
@@ -552,6 +559,95 @@ let stdio_backlog env =
   let clock = Eio.Stdenv.clock env and active = ref 0 in
   with_stdio ~max_queued:256 env (chatty_server clock active) (check_backlog clock active)
 
+(* Updates to URIs nobody watches leave nothing behind; a listener's URIs
+   are tracked while it listens and forgotten when it ends. *)
+let watched_uris env =
+  let s = Server.v ~name:"t" ~version:"1" ~resources:[] () in
+  for i = 1 to 10_000 do
+    Server.resource_updated s ("mem://" ^ string_of_int i)
+  done;
+  Alcotest.(check int) "nothing watched" 0 (Server.watched_uris s);
+  with_stdio env s (fun client ->
+      let seen = ref [] in
+      ignore
+        (ok
+           (Client.listen client { Proto.Filter.none with uris = [ "mem://a" ] } (fun method_ _ ->
+                seen := method_ :: !seen;
+                match method_ with
+                | "notifications/subscriptions/acknowledged" ->
+                    Alcotest.(check int) "one watched" 1 (Server.watched_uris s);
+                    Server.resource_updated s "mem://b";
+                    Server.resource_updated s "mem://a"
+                | _ -> Server.shutdown s)));
+      Alcotest.(check (list string))
+        "notified"
+        [ "notifications/subscriptions/acknowledged"; "notifications/resources/updated" ]
+        (List.rev !seen));
+  Alcotest.(check int) "forgotten" 0 (Server.watched_uris s)
+
+(* A response larger than [max_response], whole or as one SSE event, fails
+   its request and drops the connection; the next request reconnects. *)
+let http_response_limit env =
+  let big = String.make 4096 'x' in
+  let tools =
+    [
+      Tool.v "big" Schema.empty (fun _ () -> Ok (Tool.text big));
+      Tool.v "streamed" Schema.empty (fun ctx () ->
+          Ctx.progress ctx 1.;
+          Ok (Tool.text big));
+      tool "ok";
+    ]
+  in
+  with_http env (server tools) (fun ~sw ~net ~port ->
+      let client =
+        Client.connect (Mcp_http.Client.http1 ~sw ~net ~port ~connections:1 ~max_response:2048 ())
+      in
+      local (Client.call_tool client "big" Json.empty);
+      ignore (ok (Client.call_tool client "ok" Json.empty));
+      local
+        (Client.call_tool client "streamed" Json.empty ~on_progress:(fun ?total:_ ?message:_ _ ->
+             ()));
+      ignore (ok (Client.call_tool client "ok" Json.empty)))
+
+(* [`Auto] against a server that only knows 2025-06-18: discover fails,
+   initialize opens the session, and later requests carry its revision in
+   the header and no protocol fields in [_meta]. *)
+let negotiation _env =
+  let sent = ref [] and posted = ref [] in
+  let send ~headers ~id body ~on_note:_ =
+    let method_ = string (field [ "method" ] (parse body)) in
+    sent := (method_, headers, parse body) :: !sent;
+    Wire.to_string
+      (match method_ with
+      | "server/discover" -> Wire.error ~id (Error.method_not_found method_)
+      | "initialize" ->
+          Wire.result id
+            {|{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"old","version":"1"}}|}
+      | _ -> Wire.result id {|{"tools":[]}|})
+  in
+  let transport = Client.transport ~post:(fun ~headers:_ m -> posted := m :: !posted) send in
+  let client = Client.connect ~protocol:`Auto transport in
+  ignore (ok (Client.list_tools client));
+  ignore (ok (Client.list_tools client));
+  Alcotest.(check string) "negotiated" "2025-06-18" (ok (Client.protocol_version client));
+  Alcotest.(check (list string))
+    "methods"
+    [ "server/discover"; "initialize"; "tools/list"; "tools/list" ]
+    (List.rev_map (fun (m, _, _) -> m) !sent);
+  Alcotest.(check (list string))
+    "initialized"
+    [ {|{"jsonrpc":"2.0","method":"notifications/initialized"}|} ]
+    !posted;
+  let _, headers, body = List.hd !sent in
+  Alcotest.(check (option string))
+    "version header" (Some "2025-06-18")
+    (List.assoc_opt "MCP-Protocol-Version" headers);
+  Alcotest.(check bool) "no _meta" true (Json.find_path [ "params"; "_meta" ] body = None);
+  let _, _, init = List.nth (List.rev !sent) 1 in
+  Alcotest.(check string)
+    "client info" "mcp-sdk"
+    (string (field [ "params"; "clientInfo"; "name" ] init))
+
 let http_backlog env =
   let clock = Eio.Stdenv.clock env and active = ref 0 in
   with_http env (chatty_server clock active) (fun ~sw ~net ~port ->
@@ -630,6 +726,7 @@ let tests =
     test "state binds canonical tool arguments" state_binding;
     test "state binds prompt arguments" prompt_state_binding;
     test "request exception boundaries" exceptions;
+    test "exceptions are reported, not sent" exception_reporting;
     test "response envelope validation" response_envelopes;
     test "invalidation during list fetch" invalidation;
     test "pagination rejects stale generations" pagination;
@@ -647,4 +744,7 @@ let tests =
     io "stdio client bounds notification backlog" stdio_backlog;
     io "HTTP client bounds notification backlog" http_backlog;
     io "HTTP endpoint mounts in another server" http_embedded;
+    io "only watched URIs are tracked" watched_uris;
+    io "HTTP client bounds response size" http_response_limit;
+    io "client negotiates an earlier revision" negotiation;
   ]

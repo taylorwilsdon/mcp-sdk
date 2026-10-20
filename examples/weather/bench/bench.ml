@@ -1,10 +1,14 @@
-(* Load driver for the OCaml vs FastMCP table in ../README.md.
+(* Load driver for the tables in ../README.md: this SDK against the official
+   Go SDK and FastMCP, each in its default configuration and in one matched
+   to the OCaml server's (one core, no per-request logging).
 
-   Both servers run as child processes against a mock Open-Meteo, served by
+   Every server runs as a child process against a mock Open-Meteo, served by
    this process on domains of their own, so the numbers measure the servers
-   and not the network. Any failed call aborts the run.
+   and not the network. Each throughput cell is measured [-repeat] times on
+   one server process and reported as the median with its range; [-raw]
+   writes every sample as CSV. Any failed call aborts the run.
 
-   bench [-seconds S] [-cold N]   (from the repository root) *)
+   bench [-seconds S] [-repeat N] [-cold N] [-raw FILE]   (from the repository root) *)
 
 open Mcp
 
@@ -61,12 +65,17 @@ let mock ~sw env =
 
 let devnull ~sw env = Eio.Path.(open_out ~sw ~create:`Never (Eio.Stdenv.fs env / "/dev/null"))
 
-(* [argv] against the mock, with its logs discarded. *)
-let spawn ~sw env ~upstream ?stdin ~stdout argv =
+(* A server under test: its command line and extra environment. *)
+type server = { name : string; argv : string list; vars : (string * string) list }
+
+(* [server] against the mock, with its logs discarded. *)
+let spawn ~sw env ~upstream ?stdin ~stdout server argv =
   let mgr = Eio.Stdenv.process_mgr env and stderr = devnull ~sw env in
   let env =
     Eio.Process.Env.override
-      [ ("OPEN_METEO_GEOCODING_URL", Some upstream); ("OPEN_METEO_FORECAST_URL", Some upstream) ]
+      (("OPEN_METEO_GEOCODING_URL", Some upstream)
+      :: ("OPEN_METEO_FORECAST_URL", Some upstream)
+      :: List.map (fun (k, v) -> (k, Some v)) server.vars)
       (Eio.Process.environment mgr)
   in
   Eio.Process.spawn ~sw mgr ~env ?stdin ~stdout ~stderr argv
@@ -93,22 +102,22 @@ let rec wait_port env port =
     Eio.Time.sleep (Eio.Stdenv.clock env) 0.01;
     wait_port env port
 
-(* [f proc client] with [argv] serving [client] over stdio, or over HTTP with
-   the extra arguments [http]. The server is killed afterwards. *)
-let with_server env ~upstream ?http argv f =
+(* [f proc client] with [server] serving [client] over stdio, or over HTTP
+   with the extra arguments [http]. The server is killed afterwards. *)
+let with_server env ~upstream ?http server f =
   Eio.Switch.run @@ fun sw ->
   let proc, client =
     match http with
     | None ->
         let c2s_r, c2s_w = Eio_unix.pipe sw and s2c_r, s2c_w = Eio_unix.pipe sw in
-        let proc = spawn ~sw env ~upstream ~stdin:c2s_r ~stdout:s2c_w argv in
+        let proc = spawn ~sw env ~upstream ~stdin:c2s_r ~stdout:s2c_w server server.argv in
         Eio.Flow.close c2s_r;
         Eio.Flow.close s2c_w;
         (proc, Client.connect (Client.line_transport ~sw s2c_r c2s_w))
     | Some extra ->
         let port = free_port () in
-        let argv = argv @ ("--http" :: string_of_int port :: extra) in
-        let proc = spawn ~sw env ~upstream ~stdout:(devnull ~sw env) argv in
+        let argv = server.argv @ ("--http" :: string_of_int port :: extra) in
+        let proc = spawn ~sw env ~upstream ~stdout:(devnull ~sw env) server argv in
         wait_port env port;
         let net = Eio.Stdenv.net env in
         (proc, Client.connect (Mcp_http.Client.http1 ~sw ~net ~port ()))
@@ -131,9 +140,9 @@ let list_tools client =
 
 type load = { rate : float; p50 : float; p99 : float; cpu : float }
 
-(* [op] from [concurrency] fibers for [seconds], after a warm-up. [cpu] is
-   the server's CPU time per call. *)
-let load ~seconds proc client ~concurrency op =
+(* [op] from [concurrency] fibers for [seconds], after a warm-up, [repeat]
+   times. [cpu] is the server's CPU time per call. *)
+let load ~seconds ~repeat proc client ~concurrency op =
   let run seconds =
     let deadline = now () +. seconds in
     let rec fiber acc =
@@ -146,47 +155,62 @@ let load ~seconds proc client ~concurrency op =
     List.concat (Eio.Fiber.List.map fiber (List.init concurrency (Fun.const [])))
   in
   ignore (run 0.5);
-  let _, cpu0 = ps proc in
-  let t0 = now () in
-  let latencies = Array.of_list (run seconds) in
-  let elapsed = now () -. t0 in
-  let _, cpu1 = ps proc in
-  Array.sort Float.compare latencies;
-  let calls = float (Array.length latencies) in
-  let pct p = latencies.(int_of_float (p *. (calls -. 1.))) in
-  { rate = calls /. elapsed; p50 = pct 0.5; p99 = pct 0.99; cpu = (cpu1 -. cpu0) /. calls }
+  List.init repeat (fun _ ->
+      let _, cpu0 = ps proc in
+      let t0 = now () in
+      let latencies = Array.of_list (run seconds) in
+      let elapsed = now () -. t0 in
+      let _, cpu1 = ps proc in
+      Array.sort Float.compare latencies;
+      let calls = float (Array.length latencies) in
+      let pct p = latencies.(int_of_float (p *. (calls -. 1.))) in
+      { rate = calls /. elapsed; p50 = pct 0.5; p99 = pct 0.99; cpu = (cpu1 -. cpu0) /. calls })
 
 (* Table *)
 
-(* One cell: the value compared, whether higher is better, and its text. *)
-type cell = { value : float; higher : bool; text : string }
-
-let lower value text = { value; higher = false; text }
-
-let rate (l : load) concurrency =
-  let name, v = if concurrency = 1 then ("p50", l.p50) else ("p99", l.p99) in
-  {
-    value = l.rate;
-    higher = true;
-    text = Printf.sprintf "%.0f req/s, %s %.2f ms" l.rate name (1e3 *. v);
-  }
-
-let cpu (l : load) = lower l.cpu (Printf.sprintf "%.0f us" (1e6 *. l.cpu))
 let median l = List.nth (List.sort Float.compare l) (List.length l / 2)
 
-(* The table's rows for the server [argv]; [domains] adds the multicore HTTP
-   row. *)
-let measure env ~upstream ~seconds ~cold ~domains argv =
-  let load = load ~seconds in
+(* One cell: its samples, the value compared, whether higher is better, and
+   its text. *)
+type cell = { samples : load list; value : float; higher : bool; text : string }
+
+let lower value text = { samples = []; value; higher = false; text }
+
+let rate loads concurrency =
+  let rates = List.map (fun l -> l.rate) loads in
+  let name, pick = if concurrency = 1 then ("p50", fun l -> l.p50) else ("p99", fun l -> l.p99) in
+  let range =
+    if List.length loads < 2 then ""
+    else
+      Printf.sprintf " (%.0f-%.0f)"
+        (List.fold_left min infinity rates)
+        (List.fold_left max 0. rates)
+  in
+  {
+    samples = loads;
+    value = median rates;
+    higher = true;
+    text =
+      Printf.sprintf "%.0f req/s%s, %s %.2f ms" (median rates) range name
+        (1e3 *. median (List.map pick loads));
+  }
+
+let cpu loads =
+  let c = median (List.map (fun l -> l.cpu) loads) in
+  { (lower c (Printf.sprintf "%.0f us" (1e6 *. c))) with samples = loads }
+
+(* The table's rows for [server]; [domains] adds the multicore HTTP row. *)
+let measure env ~upstream ~seconds ~repeat ~cold ~domains server =
+  let load = load ~seconds ~repeat in
   let cold_start () =
     let t0 = now () in
-    with_server env ~upstream argv (fun _ client ->
+    with_server env ~upstream server (fun _ client ->
         list_tools client;
         now () -. t0)
   in
   let cold = median (List.init cold (fun _ -> cold_start ())) in
   let rss, c1, c64, list =
-    with_server env ~upstream argv @@ fun proc client ->
+    with_server env ~upstream server @@ fun proc client ->
     list_tools client;
     Eio.Time.sleep (Eio.Stdenv.clock env) 1.;
     let rss, _ = ps proc in
@@ -196,7 +220,7 @@ let measure env ~upstream ~seconds ~cold ~domains argv =
       load proc client ~concurrency:64 list_tools )
   in
   let http extra concurrency =
-    with_server env ~upstream ~http:extra argv @@ fun proc client ->
+    with_server env ~upstream ~http:extra server @@ fun proc client ->
     rate (load proc client ~concurrency get_weather) concurrency
   in
   [
@@ -219,29 +243,89 @@ let measure env ~upstream ~seconds ~cold ~domains argv =
       ("Server CPU per `tools/list`", cpu list);
     ]
 
+let python = [ "examples/weather/python/.venv/bin/python"; "examples/weather/python/weather.py" ]
+
+let ocaml =
+  { name = "OCaml"; argv = [ "_build/default/examples/weather/ocaml/weather.exe" ]; vars = [] }
+
+(* Default configurations, then the same SDKs matched to the OCaml server:
+   one core, no per-request logging. *)
+let others =
+  [
+    { name = "Go"; argv = [ "examples/weather/go/weather" ]; vars = [] };
+    { name = "FastMCP"; argv = python; vars = [] };
+    {
+      name = "Go, 1 core";
+      argv = [ "examples/weather/go/weather" ];
+      vars = [ ("GOMAXPROCS", "1") ];
+    };
+    { name = "FastMCP, no access log"; argv = python @ [ "--no-access-log" ]; vars = [] };
+  ]
+
+let write_raw path results =
+  Out_channel.with_open_text path @@ fun oc ->
+  output_string oc "server,row,run,rate,p50_ms,p99_ms,cpu_us\n";
+  List.iter
+    (fun (server, rows) ->
+      List.iter
+        (fun (row, cell) ->
+          List.iteri
+            (fun i l ->
+              Printf.fprintf oc "%S,%S,%d,%.1f,%.3f,%.3f,%.1f\n" server row (i + 1) l.rate
+                (1e3 *. l.p50) (1e3 *. l.p99) (1e6 *. l.cpu))
+            cell.samples)
+        rows)
+    results
+
 let () =
-  let seconds = ref 2. and cold = ref 5 in
+  let seconds = ref 2. and repeat = ref 5 and cold = ref 5 and raw = ref "" in
   Arg.parse
     [
-      ("-seconds", Arg.Set_float seconds, "S  Duration of each throughput cell (default 2)");
+      ("-seconds", Arg.Set_float seconds, "S  Duration of each throughput sample (default 2)");
+      ( "-repeat",
+        Arg.Set_int repeat,
+        "N  Samples per throughput cell, of which the median (default 5)" );
       ("-cold", Arg.Set_int cold, "N  Cold starts per server, of which the median (default 5)");
+      ("-raw", Arg.Set_string raw, "FILE  Write every sample to FILE as CSV");
     ]
     (fun _ -> ())
-    "bench [-seconds S] [-cold N]  (from the repository root)";
+    "bench [-seconds S] [-repeat N] [-cold N] [-raw FILE]  (from the repository root)";
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
-  let measure = measure env ~upstream:(mock ~sw env) ~seconds:!seconds ~cold:!cold in
-  let ocaml = measure ~domains:4 [ "_build/default/examples/weather/ocaml/weather.exe" ] in
-  let python =
-    measure ~domains:0
-      [ "examples/weather/python/.venv/bin/python"; "examples/weather/python/weather.py" ]
+  let measure =
+    measure env ~upstream:(mock ~sw env) ~seconds:!seconds ~repeat:!repeat ~cold:!cold
   in
-  print_endline "| | OCaml | FastMCP | |\n| --- | ---: | ---: | ---: |";
+  let results =
+    (ocaml.name, measure ~domains:4 ocaml)
+    :: List.map (fun s -> (s.name, measure ~domains:0 s)) others
+  in
+  if !raw <> "" then write_raw !raw results;
+  let ocaml_rows = List.assoc ocaml.name results in
+  let names = List.map fst results in
+  Printf.printf "| | %s |\n| --- |%s\n" (String.concat " | " names)
+    (String.concat "" (List.map (fun _ -> " ---: |") names));
+  List.iter
+    (fun (label, _) ->
+      let cells =
+        List.map
+          (fun (_, rows) -> match List.assoc_opt label rows with Some c -> c.text | None -> "n/a")
+          results
+      in
+      Printf.printf "| %s | %s |\n" label (String.concat " | " cells))
+    ocaml_rows;
+  (* How many times better the OCaml server is, per row and SDK. *)
+  print_newline ();
+  let others = List.tl results in
+  Printf.printf "| OCaml vs | %s |\n| --- |%s\n"
+    (String.concat " | " (List.map fst others))
+    (String.concat "" (List.map (fun _ -> " ---: |") others));
   List.iter
     (fun (label, o) ->
-      match List.assoc_opt label python with
-      | Some p ->
-          let ratio = if o.higher then o.value /. p.value else p.value /. o.value in
-          Printf.printf "| %s | %s | %s | %.2gx |\n" label o.text p.text ratio
-      | None -> Printf.printf "| %s | %s | n/a | |\n" label o.text)
-    ocaml
+      let ratio (_, rows) =
+        match List.assoc_opt label rows with
+        | Some p ->
+            Printf.sprintf "%.2gx" (if o.higher then o.value /. p.value else p.value /. o.value)
+        | None -> "n/a"
+      in
+      Printf.printf "| %s | %s |\n" label (String.concat " | " (List.map ratio others)))
+    ocaml_rows

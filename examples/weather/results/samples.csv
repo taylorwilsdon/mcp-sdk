@@ -1,0 +1,181 @@
+server,row,run,rate,p50_ms,p99_ms,cpu_us
+"OCaml","stdio `get_weather`, 1 in flight",1,1025.7,0.944,1.553,477.6
+"OCaml","stdio `get_weather`, 1 in flight",2,1021.3,0.945,1.582,479.7
+"OCaml","stdio `get_weather`, 1 in flight",3,1016.5,0.949,1.587,481.8
+"OCaml","stdio `get_weather`, 1 in flight",4,1031.0,0.934,1.596,479.9
+"OCaml","stdio `get_weather`, 1 in flight",5,1020.0,0.945,1.591,480.4
+"OCaml","stdio `get_weather`, 64 in flight",1,13218.4,4.817,6.585,73.6
+"OCaml","stdio `get_weather`, 64 in flight",2,11469.0,5.559,7.544,84.8
+"OCaml","stdio `get_weather`, 64 in flight",3,10331.3,6.176,8.469,94.1
+"OCaml","stdio `get_weather`, 64 in flight",4,9512.2,6.699,9.175,102.8
+"OCaml","stdio `get_weather`, 64 in flight",5,8951.9,7.126,9.515,108.7
+"OCaml","HTTP `get_weather`, 1 in flight",1,2025.5,0.489,0.638,138.2
+"OCaml","HTTP `get_weather`, 1 in flight",2,1981.1,0.498,0.695,143.8
+"OCaml","HTTP `get_weather`, 1 in flight",3,1962.8,0.499,0.735,147.7
+"OCaml","HTTP `get_weather`, 1 in flight",4,1957.8,0.497,0.822,153.2
+"OCaml","HTTP `get_weather`, 1 in flight",5,1937.3,0.498,0.852,154.8
+"OCaml","HTTP `get_weather`, 64 in flight",1,9345.4,6.784,9.337,102.4
+"OCaml","HTTP `get_weather`, 64 in flight",2,8402.6,7.530,10.594,115.2
+"OCaml","HTTP `get_weather`, 64 in flight",3,7962.6,7.968,10.889,123.2
+"OCaml","HTTP `get_weather`, 64 in flight",4,7356.7,8.638,11.796,132.8
+"OCaml","HTTP `get_weather`, 64 in flight",5,6872.3,9.293,12.366,142.2
+"OCaml","HTTP `get_weather`, 64 in flight, `--domains 4`",1,7493.2,8.533,10.361,632.6
+"OCaml","HTTP `get_weather`, 64 in flight, `--domains 4`",2,7537.3,8.509,10.317,623.1
+"OCaml","HTTP `get_weather`, 64 in flight, `--domains 4`",3,7504.2,8.540,10.404,622.8
+"OCaml","HTTP `get_weather`, 64 in flight, `--domains 4`",4,7483.7,8.579,10.690,616.6
+"OCaml","HTTP `get_weather`, 64 in flight, `--domains 4`",5,7565.0,8.444,10.649,606.6
+"OCaml","stdio `tools/list`, 64 in flight (no upstream)",1,44800.6,1.417,1.629,7.9
+"OCaml","stdio `tools/list`, 64 in flight (no upstream)",2,44947.3,1.414,1.621,7.9
+"OCaml","stdio `tools/list`, 64 in flight (no upstream)",3,44915.4,1.417,1.583,7.9
+"OCaml","stdio `tools/list`, 64 in flight (no upstream)",4,44809.6,1.418,1.618,7.9
+"OCaml","stdio `tools/list`, 64 in flight (no upstream)",5,44498.4,1.426,1.646,8.0
+"OCaml","Server CPU per `get_weather` (stdio, 64 in flight)",1,13218.4,4.817,6.585,73.6
+"OCaml","Server CPU per `get_weather` (stdio, 64 in flight)",2,11469.0,5.559,7.544,84.8
+"OCaml","Server CPU per `get_weather` (stdio, 64 in flight)",3,10331.3,6.176,8.469,94.1
+"OCaml","Server CPU per `get_weather` (stdio, 64 in flight)",4,9512.2,6.699,9.175,102.8
+"OCaml","Server CPU per `get_weather` (stdio, 64 in flight)",5,8951.9,7.126,9.515,108.7
+"OCaml","Server CPU per `tools/list`",1,44800.6,1.417,1.629,7.9
+"OCaml","Server CPU per `tools/list`",2,44947.3,1.414,1.621,7.9
+"OCaml","Server CPU per `tools/list`",3,44915.4,1.417,1.583,7.9
+"OCaml","Server CPU per `tools/list`",4,44809.6,1.418,1.618,7.9
+"OCaml","Server CPU per `tools/list`",5,44498.4,1.426,1.646,8.0
+"Go","stdio `get_weather`, 1 in flight",1,2671.4,0.342,0.632,312.5
+"Go","stdio `get_weather`, 1 in flight",2,2650.9,0.341,0.631,347.0
+"Go","stdio `get_weather`, 1 in flight",3,2661.6,0.341,0.633,347.5
+"Go","stdio `get_weather`, 1 in flight",4,2621.6,0.346,0.640,326.1
+"Go","stdio `get_weather`, 1 in flight",5,2606.9,0.348,0.666,331.8
+"Go","stdio `get_weather`, 64 in flight",1,7307.7,8.752,9.804,649.7
+"Go","stdio `get_weather`, 64 in flight",2,7301.1,8.748,9.961,640.7
+"Go","stdio `get_weather`, 64 in flight",3,7198.4,8.872,9.963,660.1
+"Go","stdio `get_weather`, 64 in flight",4,6764.8,9.300,11.941,690.9
+"Go","stdio `get_weather`, 64 in flight",5,6631.4,9.591,11.838,713.7
+"Go","HTTP `get_weather`, 1 in flight",1,2435.9,0.371,0.654,369.5
+"Go","HTTP `get_weather`, 1 in flight",2,2416.0,0.372,0.667,384.9
+"Go","HTTP `get_weather`, 1 in flight",3,2415.7,0.370,0.677,401.4
+"Go","HTTP `get_weather`, 1 in flight",4,2363.3,0.375,0.688,421.0
+"Go","HTTP `get_weather`, 1 in flight",5,2389.9,0.372,0.695,410.0
+"Go","HTTP `get_weather`, 64 in flight",1,5247.5,11.969,23.371,1410.0
+"Go","HTTP `get_weather`, 64 in flight",2,5371.7,11.783,22.439,1337.5
+"Go","HTTP `get_weather`, 64 in flight",3,5388.7,11.642,22.293,1337.0
+"Go","HTTP `get_weather`, 64 in flight",4,5310.1,11.908,22.759,1364.2
+"Go","HTTP `get_weather`, 64 in flight",5,6474.6,9.744,19.187,1107.3
+"Go","stdio `tools/list`, 64 in flight (no upstream)",1,15386.1,4.137,4.906,273.8
+"Go","stdio `tools/list`, 64 in flight (no upstream)",2,15282.2,4.172,4.944,277.3
+"Go","stdio `tools/list`, 64 in flight (no upstream)",3,15225.3,4.189,4.690,279.6
+"Go","stdio `tools/list`, 64 in flight (no upstream)",4,15131.2,4.210,4.739,279.4
+"Go","stdio `tools/list`, 64 in flight (no upstream)",5,15175.7,4.209,4.665,280.5
+"Go","Server CPU per `get_weather` (stdio, 64 in flight)",1,7307.7,8.752,9.804,649.7
+"Go","Server CPU per `get_weather` (stdio, 64 in flight)",2,7301.1,8.748,9.961,640.7
+"Go","Server CPU per `get_weather` (stdio, 64 in flight)",3,7198.4,8.872,9.963,660.1
+"Go","Server CPU per `get_weather` (stdio, 64 in flight)",4,6764.8,9.300,11.941,690.9
+"Go","Server CPU per `get_weather` (stdio, 64 in flight)",5,6631.4,9.591,11.838,713.7
+"Go","Server CPU per `tools/list`",1,15386.1,4.137,4.906,273.8
+"Go","Server CPU per `tools/list`",2,15282.2,4.172,4.944,277.3
+"Go","Server CPU per `tools/list`",3,15225.3,4.189,4.690,279.6
+"Go","Server CPU per `tools/list`",4,15131.2,4.210,4.739,279.4
+"Go","Server CPU per `tools/list`",5,15175.7,4.209,4.665,280.5
+"FastMCP","stdio `get_weather`, 1 in flight",1,527.2,1.888,2.100,1213.3
+"FastMCP","stdio `get_weather`, 1 in flight",2,518.4,1.902,2.410,1263.3
+"FastMCP","stdio `get_weather`, 1 in flight",3,582.4,1.695,2.093,1133.0
+"FastMCP","stdio `get_weather`, 1 in flight",4,585.0,1.691,2.037,1136.8
+"FastMCP","stdio `get_weather`, 1 in flight",5,580.9,1.694,2.076,1153.2
+"FastMCP","stdio `get_weather`, 64 in flight",1,679.1,93.475,155.950,1302.1
+"FastMCP","stdio `get_weather`, 64 in flight",2,669.5,94.010,168.703,1321.5
+"FastMCP","stdio `get_weather`, 64 in flight",3,660.5,95.047,156.259,1338.3
+"FastMCP","stdio `get_weather`, 64 in flight",4,670.8,93.633,168.126,1318.5
+"FastMCP","stdio `get_weather`, 64 in flight",5,684.5,92.717,152.583,1291.7
+"FastMCP","HTTP `get_weather`, 1 in flight",1,547.7,1.797,2.327,1295.6
+"FastMCP","HTTP `get_weather`, 1 in flight",2,553.4,1.791,1.987,1282.7
+"FastMCP","HTTP `get_weather`, 1 in flight",3,551.9,1.788,2.039,1295.3
+"FastMCP","HTTP `get_weather`, 1 in flight",4,550.5,1.792,2.089,1288.6
+"FastMCP","HTTP `get_weather`, 1 in flight",5,554.0,1.790,2.031,1290.6
+"FastMCP","HTTP `get_weather`, 64 in flight",1,219.1,242.629,773.388,3110.6
+"FastMCP","HTTP `get_weather`, 64 in flight",2,221.2,250.138,793.325,3068.9
+"FastMCP","HTTP `get_weather`, 64 in flight",3,335.0,160.743,537.432,2361.3
+"FastMCP","HTTP `get_weather`, 64 in flight",4,342.5,161.120,503.393,2344.0
+"FastMCP","HTTP `get_weather`, 64 in flight",5,346.2,159.179,476.888,2304.5
+"FastMCP","stdio `tools/list`, 64 in flight (no upstream)",1,2522.2,25.093,41.511,341.1
+"FastMCP","stdio `tools/list`, 64 in flight (no upstream)",2,2523.8,25.162,36.898,342.9
+"FastMCP","stdio `tools/list`, 64 in flight (no upstream)",3,2512.8,25.152,37.597,344.3
+"FastMCP","stdio `tools/list`, 64 in flight (no upstream)",4,2511.9,25.146,37.317,344.5
+"FastMCP","stdio `tools/list`, 64 in flight (no upstream)",5,2522.5,25.157,37.386,343.0
+"FastMCP","Server CPU per `get_weather` (stdio, 64 in flight)",1,679.1,93.475,155.950,1302.1
+"FastMCP","Server CPU per `get_weather` (stdio, 64 in flight)",2,669.5,94.010,168.703,1321.5
+"FastMCP","Server CPU per `get_weather` (stdio, 64 in flight)",3,660.5,95.047,156.259,1338.3
+"FastMCP","Server CPU per `get_weather` (stdio, 64 in flight)",4,670.8,93.633,168.126,1318.5
+"FastMCP","Server CPU per `get_weather` (stdio, 64 in flight)",5,684.5,92.717,152.583,1291.7
+"FastMCP","Server CPU per `tools/list`",1,2522.2,25.093,41.511,341.1
+"FastMCP","Server CPU per `tools/list`",2,2523.8,25.162,36.898,342.9
+"FastMCP","Server CPU per `tools/list`",3,2512.8,25.152,37.597,344.3
+"FastMCP","Server CPU per `tools/list`",4,2511.9,25.146,37.317,344.5
+"FastMCP","Server CPU per `tools/list`",5,2522.5,25.157,37.386,343.0
+"Go, 1 core","stdio `get_weather`, 1 in flight",1,2053.6,0.473,0.670,177.7
+"Go, 1 core","stdio `get_weather`, 1 in flight",2,2047.0,0.475,0.655,175.8
+"Go, 1 core","stdio `get_weather`, 1 in flight",3,2044.4,0.474,0.674,176.1
+"Go, 1 core","stdio `get_weather`, 1 in flight",4,2007.7,0.481,0.676,176.8
+"Go, 1 core","stdio `get_weather`, 1 in flight",5,2045.5,0.473,0.677,176.0
+"Go, 1 core","stdio `get_weather`, 64 in flight",1,4003.6,16.810,31.905,126.8
+"Go, 1 core","stdio `get_weather`, 64 in flight",2,3817.5,17.249,33.808,131.8
+"Go, 1 core","stdio `get_weather`, 64 in flight",3,4044.0,15.844,33.926,130.5
+"Go, 1 core","stdio `get_weather`, 64 in flight",4,3952.1,16.753,32.229,131.8
+"Go, 1 core","stdio `get_weather`, 64 in flight",5,3948.1,16.085,33.728,130.0
+"Go, 1 core","HTTP `get_weather`, 1 in flight",1,2796.4,0.337,0.506,175.2
+"Go, 1 core","HTTP `get_weather`, 1 in flight",2,2811.7,0.336,0.520,172.5
+"Go, 1 core","HTTP `get_weather`, 1 in flight",3,2791.8,0.336,0.524,173.7
+"Go, 1 core","HTTP `get_weather`, 1 in flight",4,2758.4,0.339,0.576,177.6
+"Go, 1 core","HTTP `get_weather`, 1 in flight",5,2779.3,0.336,0.599,172.7
+"Go, 1 core","HTTP `get_weather`, 64 in flight",1,4712.9,11.525,56.593,210.6
+"Go, 1 core","HTTP `get_weather`, 64 in flight",2,4714.3,12.045,51.922,211.5
+"Go, 1 core","HTTP `get_weather`, 64 in flight",3,4705.4,12.297,50.444,213.0
+"Go, 1 core","HTTP `get_weather`, 64 in flight",4,4731.4,11.508,62.760,210.8
+"Go, 1 core","HTTP `get_weather`, 64 in flight",5,4682.5,12.062,55.595,212.8
+"Go, 1 core","stdio `tools/list`, 64 in flight (no upstream)",1,10246.0,4.624,15.214,68.0
+"Go, 1 core","stdio `tools/list`, 64 in flight (no upstream)",2,9983.9,5.335,15.297,67.8
+"Go, 1 core","stdio `tools/list`, 64 in flight (no upstream)",3,9887.9,4.896,15.827,68.1
+"Go, 1 core","stdio `tools/list`, 64 in flight (no upstream)",4,10280.8,4.607,15.569,67.9
+"Go, 1 core","stdio `tools/list`, 64 in flight (no upstream)",5,9998.8,4.913,15.345,68.0
+"Go, 1 core","Server CPU per `get_weather` (stdio, 64 in flight)",1,4003.6,16.810,31.905,126.8
+"Go, 1 core","Server CPU per `get_weather` (stdio, 64 in flight)",2,3817.5,17.249,33.808,131.8
+"Go, 1 core","Server CPU per `get_weather` (stdio, 64 in flight)",3,4044.0,15.844,33.926,130.5
+"Go, 1 core","Server CPU per `get_weather` (stdio, 64 in flight)",4,3952.1,16.753,32.229,131.8
+"Go, 1 core","Server CPU per `get_weather` (stdio, 64 in flight)",5,3948.1,16.085,33.728,130.0
+"Go, 1 core","Server CPU per `tools/list`",1,10246.0,4.624,15.214,68.0
+"Go, 1 core","Server CPU per `tools/list`",2,9983.9,5.335,15.297,67.8
+"Go, 1 core","Server CPU per `tools/list`",3,9887.9,4.896,15.827,68.1
+"Go, 1 core","Server CPU per `tools/list`",4,10280.8,4.607,15.569,67.9
+"Go, 1 core","Server CPU per `tools/list`",5,9998.8,4.913,15.345,68.0
+"FastMCP, no access log","stdio `get_weather`, 1 in flight",1,531.6,1.858,2.251,1203.0
+"FastMCP, no access log","stdio `get_weather`, 1 in flight",2,564.4,1.754,1.982,1151.5
+"FastMCP, no access log","stdio `get_weather`, 1 in flight",3,597.3,1.666,1.927,1113.0
+"FastMCP, no access log","stdio `get_weather`, 1 in flight",4,600.1,1.657,1.916,1107.4
+"FastMCP, no access log","stdio `get_weather`, 1 in flight",5,597.9,1.659,1.867,1112.0
+"FastMCP, no access log","stdio `get_weather`, 64 in flight",1,685.2,91.694,155.360,1283.5
+"FastMCP, no access log","stdio `get_weather`, 64 in flight",2,687.2,92.240,154.845,1286.1
+"FastMCP, no access log","stdio `get_weather`, 64 in flight",3,688.4,91.522,155.304,1284.3
+"FastMCP, no access log","stdio `get_weather`, 64 in flight",4,683.1,92.205,152.139,1294.5
+"FastMCP, no access log","stdio `get_weather`, 64 in flight",5,684.1,92.093,152.942,1285.4
+"FastMCP, no access log","HTTP `get_weather`, 1 in flight",1,560.1,1.767,1.959,1248.9
+"FastMCP, no access log","HTTP `get_weather`, 1 in flight",2,561.0,1.771,2.089,1238.9
+"FastMCP, no access log","HTTP `get_weather`, 1 in flight",3,552.5,1.786,2.166,1248.9
+"FastMCP, no access log","HTTP `get_weather`, 1 in flight",4,558.5,1.766,2.091,1262.3
+"FastMCP, no access log","HTTP `get_weather`, 1 in flight",5,557.0,1.772,2.004,1255.6
+"FastMCP, no access log","HTTP `get_weather`, 64 in flight",1,219.6,238.807,852.924,3067.2
+"FastMCP, no access log","HTTP `get_weather`, 64 in flight",2,224.6,247.479,694.178,2991.8
+"FastMCP, no access log","HTTP `get_weather`, 64 in flight",3,345.9,158.359,473.801,2277.1
+"FastMCP, no access log","HTTP `get_weather`, 64 in flight",4,354.3,158.421,447.284,2250.7
+"FastMCP, no access log","HTTP `get_weather`, 64 in flight",5,355.7,156.375,484.540,2234.0
+"FastMCP, no access log","stdio `tools/list`, 64 in flight (no upstream)",1,2560.8,24.707,36.307,337.9
+"FastMCP, no access log","stdio `tools/list`, 64 in flight (no upstream)",2,2557.2,24.718,36.348,336.4
+"FastMCP, no access log","stdio `tools/list`, 64 in flight (no upstream)",3,2554.7,24.769,36.405,337.9
+"FastMCP, no access log","stdio `tools/list`, 64 in flight (no upstream)",4,2569.7,24.686,36.262,334.8
+"FastMCP, no access log","stdio `tools/list`, 64 in flight (no upstream)",5,2540.9,24.734,42.850,340.6
+"FastMCP, no access log","Server CPU per `get_weather` (stdio, 64 in flight)",1,685.2,91.694,155.360,1283.5
+"FastMCP, no access log","Server CPU per `get_weather` (stdio, 64 in flight)",2,687.2,92.240,154.845,1286.1
+"FastMCP, no access log","Server CPU per `get_weather` (stdio, 64 in flight)",3,688.4,91.522,155.304,1284.3
+"FastMCP, no access log","Server CPU per `get_weather` (stdio, 64 in flight)",4,683.1,92.205,152.139,1294.5
+"FastMCP, no access log","Server CPU per `get_weather` (stdio, 64 in flight)",5,684.1,92.093,152.942,1285.4
+"FastMCP, no access log","Server CPU per `tools/list`",1,2560.8,24.707,36.307,337.9
+"FastMCP, no access log","Server CPU per `tools/list`",2,2557.2,24.718,36.348,336.4
+"FastMCP, no access log","Server CPU per `tools/list`",3,2554.7,24.769,36.405,337.9
+"FastMCP, no access log","Server CPU per `tools/list`",4,2569.7,24.686,36.262,334.8
+"FastMCP, no access log","Server CPU per `tools/list`",5,2540.9,24.734,42.850,340.6

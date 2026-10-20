@@ -149,33 +149,122 @@ let conditions = function
   | 96 | 99 -> "Thunderstorm with hail"
   | _ -> "Unknown"
 
-let report place units symbol c =
-  let conditions = conditions c.code in
-  Tool.structured
+(* The tool's structured result. Its codec and advertised schema are one
+   value, the counterpart of the Pydantic model in ../python. *)
+type weather = {
+  city : string;
+  country : string;
+  latitude : float;
+  longitude : float;
+  temperature : float;
+  apparent_temperature : float;
+  humidity : float;
+  wind_speed_kmh : float;
+  conditions : string;
+  units : string;
+}
+
+let weather =
+  let fields =
+    [
+      ("city", "string");
+      ("country", "string");
+      ("latitude", "number");
+      ("longitude", "number");
+      ("temperature", "number");
+      ("apparent_temperature", "number");
+      ("humidity", "number");
+      ("wind_speed_kmh", "number");
+      ("conditions", "string");
+    ]
+  in
+  let units =
+    Json.obj
+      [
+        ("type", Json.str "string");
+        ("enum", Json.list [ Json.str "celsius"; Json.str "fahrenheit" ]);
+      ]
+  in
+  let schema =
+    Json.obj
+      [
+        ("type", Json.str "object");
+        ( "properties",
+          Json.obj
+            (List.map (fun (name, ty) -> (name, Json.obj [ ("type", Json.str ty) ])) fields
+            @ [ ("units", units) ]) );
+        ("required", Json.list (List.map Json.str (List.map fst fields @ [ "units" ])));
+      ]
+  in
+  let codec =
+    Jsont.Object.(
+      map
+        (fun
+          city
+          country
+          latitude
+          longitude
+          temperature
+          apparent_temperature
+          humidity
+          wind_speed_kmh
+          conditions
+          units
+        ->
+          {
+            city;
+            country;
+            latitude;
+            longitude;
+            temperature;
+            apparent_temperature;
+            humidity;
+            wind_speed_kmh;
+            conditions;
+            units;
+          })
+      |> mem "city" Jsont.string ~enc:(fun w -> w.city)
+      |> mem "country" Jsont.string ~enc:(fun w -> w.country)
+      |> mem "latitude" Jsont.number ~enc:(fun w -> w.latitude)
+      |> mem "longitude" Jsont.number ~enc:(fun w -> w.longitude)
+      |> mem "temperature" Jsont.number ~enc:(fun w -> w.temperature)
+      |> mem "apparent_temperature" Jsont.number ~enc:(fun w -> w.apparent_temperature)
+      |> mem "humidity" Jsont.number ~enc:(fun w -> w.humidity)
+      |> mem "wind_speed_kmh" Jsont.number ~enc:(fun w -> w.wind_speed_kmh)
+      |> mem "conditions" Jsont.string ~enc:(fun w -> w.conditions)
+      |> mem "units" Jsont.string ~enc:(fun w -> w.units)
+      |> finish)
+  in
+  Tool.output ~schema codec
+
+let report (place : place) units symbol (c : current) =
+  let w =
+    {
+      city = place.name;
+      country = place.country;
+      latitude = place.latitude;
+      longitude = place.longitude;
+      temperature = c.temperature;
+      apparent_temperature = c.apparent;
+      humidity = c.humidity;
+      wind_speed_kmh = c.wind;
+      conditions = conditions c.code;
+      units;
+    }
+  in
+  Tool.return weather
     ~content:
       [
         Proto.Content.text
-          (Printf.sprintf "%s, %s: %g%s (feels like %g%s), %s, humidity %g%%, wind %g km/h"
-             place.name place.country c.temperature symbol c.apparent symbol conditions c.humidity
-             c.wind);
+          (Printf.sprintf "%s, %s: %g%s (feels like %g%s), %s, humidity %g%%, wind %g km/h" w.city
+             w.country w.temperature symbol w.apparent_temperature symbol w.conditions w.humidity
+             w.wind_speed_kmh);
       ]
-    (Json.obj
-       [
-         ("city", Json.str place.name);
-         ("country", Json.str place.country);
-         ("latitude", Json.num place.latitude);
-         ("longitude", Json.num place.longitude);
-         ("temperature", Json.num c.temperature);
-         ("apparent_temperature", Json.num c.apparent);
-         ("humidity", Json.num c.humidity);
-         ("wind_speed_kmh", Json.num c.wind);
-         ("conditions", Json.str conditions);
-         ("units", Json.str units);
-       ])
+    w
 
 let get_weather net =
   let geocoding = upstream net geocoding_api and forecast = upstream net forecast_api in
-  Tool.v "get_weather" ~description:"Current weather for a city, from Open-Meteo"
+  Tool.v "get_weather" ~description:"Current weather for a city, from Open-Meteo" ~output:weather
     ~annotations:(Proto.Tool_annotations.v ~read_only:true ())
     Schema.(
       let+ city = req "city" string ~doc:"City name, e.g. Berlin"

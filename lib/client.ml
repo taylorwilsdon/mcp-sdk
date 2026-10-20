@@ -4,41 +4,37 @@ type error = Remote of Error.t | Local of string
 
 (* A transport sends one serialized request and blocks until its response,
    handing request-scoped notifications to [on_note]. Cancelling the calling
-   fiber cancels the request in the transport's own way. *)
+   fiber cancels the request in the transport's own way. [post] sends a
+   message that has no response, and [requests] takes the handler for
+   requests the server sends outside any request's stream. *)
 type transport = {
   send : headers:(string * string) list -> id:Id.t -> string -> on_note:(string -> unit) -> string;
+  post : headers:(string * string) list -> string -> unit;
+  requests : (string -> unit) -> unit;
 }
 
+let transport ?(post = fun ~headers:_ _ -> ()) ?(requests = ignore) send = { send; post; requests }
+
+type protocol = [ `Modern | `Legacy | `Auto ]
 type input_handler = string -> Proto.Input_request.t -> Json.t option
 type cached = { expires : float; value : Json.t list }
 
 type t = {
   transport : transport;
-  meta : (string * Json.t) list;  (** The [_meta] every request carries. *)
+  protocol : protocol;
+  info : Proto.Implementation.t option;
+  capabilities : Proto.Client_caps.t;
+  meta : (string * Json.t) list;  (** The [_meta] every 2026-07-28 request carries. *)
   on_input : input_handler;
   next_id : int Atomic.t;
   cache : (string, cached) Hashtbl.t;
   generations : (string, int) Hashtbl.t;
   mutable tools : Proto.Tool_info.t list;
+  mutable version : string option;  (** The revision in use, once negotiated. *)
+  negotiation : Eio.Mutex.t;
 }
 
-let connect ?info ?(capabilities = Proto.Client_caps.none) ?(on_input = fun _ _ -> None) transport =
-  let encode codec v = Result.get_ok (Jsont.Json.encode codec v) in
-  let meta =
-    (Proto.key_protocol_version, Json.str Proto.version)
-    :: (Proto.key_client_capabilities, encode Proto.Client_caps.codec capabilities)
-    :: Option.fold info ~none:[] ~some:(fun i ->
-        [ (Proto.key_client_info, encode Proto.Implementation.codec i) ])
-  in
-  {
-    transport;
-    meta;
-    on_input;
-    next_id = Atomic.make 1;
-    cache = Hashtbl.create 8;
-    generations = Hashtbl.create 8;
-    tools = [];
-  }
+let encode codec v = Result.get_ok (Jsont.Json.encode codec v)
 
 let pp_error ppf = function
   | Remote e -> Error.pp ppf e
@@ -137,12 +133,49 @@ let response_codec =
   |> O.mem "jsonrpc" Jsont.string |> O.mem "id" Id.codec |> O.opt_mem "result" Jsont.json
   |> O.opt_mem "error" Error.codec |> O.finish
 
-let meta t ~progress id =
-  Json.obj (if progress then ("progressToken", Id.to_json id) :: t.meta else t.meta)
+let is_legacy version = version <> Proto.version
+let legacy_headers version = [ ("MCP-Protocol-Version", version) ]
 
-let send t ?on_note method_ params =
+let server_request =
+  O.map (fun id method_ params -> (id, { Proto.Input_request.method_; params }))
+  |> O.mem "id" Id.codec |> O.mem "method" Jsont.string
+  |> O.mem "params" Jsont.json ~dec_absent:Json.empty
+  |> O.finish
+
+(* Earlier revisions put input requests to the client as requests of their
+   own, on the stream of the request that needs them or, over stdio, on
+   their own. They are answered through [on_input], keyed by request id. *)
+let answer t ~version (id, (q : Proto.Input_request.t)) =
+  let input =
+    match q.method_ with
+    | "ping" -> Some Json.empty
+    | _ -> (
+        match t.on_input (Id.to_wire id) q with
+        | a -> a
+        | exception (Eio.Cancel.Cancelled _ as e) -> raise e
+        | exception _ -> None)
+  in
+  let reply =
+    match input with
+    | Some a -> Wire.result id (Json.to_string a)
+    | None -> Wire.error ~id (Error.internal_error ("No answer for " ^ q.method_))
+  in
+  t.transport.post ~headers:(legacy_headers version) (Wire.to_string reply)
+
+let answer_raw t raw =
+  match Json.decode server_request raw with
+  | Ok r ->
+      let version = Option.value t.version ~default:(List.hd Proto.legacy_versions) in
+      answer t ~version r
+  | Error _ -> ()
+
+(* One request at a given revision. A 2026-07-28 request describes itself in
+   [_meta]; one of an earlier revision leaves that to its session. *)
+let exchange t ~version ?on_note method_ params =
   let id = Id.Int (Atomic.fetch_and_add t.next_id 1) in
-  let params = Json.obj (("_meta", meta t ~progress:(on_note <> None) id) :: params) in
+  let progress = if on_note <> None then [ ("progressToken", Id.to_json id) ] else [] in
+  let meta = if is_legacy version then progress else progress @ t.meta in
+  let params = Json.obj (if meta = [] then params else ("_meta", Json.obj meta) :: params) in
   let body =
     String.concat ""
       [
@@ -156,7 +189,16 @@ let send t ?on_note method_ params =
       ]
   in
   let on_note = Option.value on_note ~default:ignore in
-  match t.transport.send ~headers:(headers t method_ params) ~id body ~on_note with
+  let on_note, headers =
+    if is_legacy version then
+      ( (fun raw ->
+          match Json.decode server_request raw with
+          | Ok r -> answer t ~version r
+          | Error _ -> on_note raw),
+        legacy_headers version )
+    else (on_note, headers t method_ params)
+  in
+  match t.transport.send ~headers ~id body ~on_note with
   | exception (Eio.Cancel.Cancelled _ as e) -> raise e
   | exception e -> Error (Local (Printexc.to_string e))
   | raw -> (
@@ -167,6 +209,91 @@ let send t ?on_note method_ params =
       | Ok { error = Some e; result = None; _ } -> Error (Remote e)
       | Ok { result = Some r; error = None; _ } -> Ok r
       | Ok _ -> Error (Local "Response must have exactly one of result or error"))
+
+let typed codec = function
+  | Error _ as e -> e
+  | Ok json -> Result.map_error (fun m -> Local m) (Json.decode_json codec json)
+
+let default_info = Proto.Implementation.v ~version:"0.1.0" "mcp-sdk"
+
+let initialize t =
+  let requested = List.hd Proto.legacy_versions in
+  let params =
+    [
+      ("protocolVersion", Json.str requested);
+      ("capabilities", encode Proto.Client_caps.codec t.capabilities);
+      ("clientInfo", encode Proto.Implementation.codec (Option.value t.info ~default:default_info));
+    ]
+  in
+  match typed Proto.Initialize_result.codec (exchange t ~version:requested "initialize" params) with
+  | Error e -> Error e
+  | Ok r when List.mem r.protocol_version Proto.legacy_versions -> (
+      match
+        t.transport.post
+          ~headers:(legacy_headers r.protocol_version)
+          {|{"jsonrpc":"2.0","method":"notifications/initialized"}|}
+      with
+      | () -> Ok r.protocol_version
+      | exception (Eio.Cancel.Cancelled _ as e) -> raise e
+      | exception e -> Error (Local (Printexc.to_string e)))
+  | Ok r -> Error (Local ("Unsupported protocol version " ^ r.protocol_version))
+
+(* [`Auto] asks with 2026-07-28 first: a server of an earlier revision
+   answers [server/discover] with an error, as it knows neither the method
+   nor a request without a session. *)
+let negotiate t =
+  match t.protocol with
+  | `Modern -> Ok Proto.version
+  | `Legacy -> initialize t
+  | `Auto -> (
+      match exchange t ~version:Proto.version "server/discover" [] with
+      | Ok _ -> Ok Proto.version
+      | Error (Remote _) -> initialize t
+      | Error e -> Error e)
+
+(* Negotiated once, on first use. A failure is not kept, so a later request
+   tries again. *)
+let protocol_version t =
+  match t.version with
+  | Some v -> Ok v
+  | None ->
+      Eio.Mutex.use_ro t.negotiation (fun () ->
+          match t.version with
+          | Some v -> Ok v
+          | None ->
+              let r = negotiate t in
+              Result.iter (fun v -> t.version <- Some v) r;
+              r)
+
+let send t ?on_note method_ params =
+  Result.bind (protocol_version t) (fun version -> exchange t ~version ?on_note method_ params)
+
+let connect ?info ?(capabilities = Proto.Client_caps.none) ?(on_input = fun _ _ -> None)
+    ?(protocol = `Modern) transport =
+  let meta =
+    (Proto.key_protocol_version, Json.str Proto.version)
+    :: (Proto.key_client_capabilities, encode Proto.Client_caps.codec capabilities)
+    :: Option.fold info ~none:[] ~some:(fun i ->
+        [ (Proto.key_client_info, encode Proto.Implementation.codec i) ])
+  in
+  let t =
+    {
+      transport;
+      protocol;
+      info;
+      capabilities;
+      meta;
+      on_input;
+      next_id = Atomic.make 1;
+      cache = Hashtbl.create 8;
+      generations = Hashtbl.create 8;
+      tools = [];
+      version = (if protocol = `Modern then Some Proto.version else None);
+      negotiation = Eio.Mutex.create ();
+    }
+  in
+  transport.requests (answer_raw t);
+  t
 
 let result_type r =
   match Json.find "resultType" r with Some (Jsont.String (s, _)) -> s | _ -> "complete"
@@ -198,10 +325,6 @@ let rec request t ?on_note ?(rounds = 8) method_ params =
                   request t ?on_note ~rounds:(rounds - 1) method_ params))
       | "input_required" -> Error (Local "Too many input rounds")
       | other -> Error (Local ("Unknown resultType " ^ other)))
-
-let typed codec = function
-  | Error _ as e -> e
-  | Ok json -> Result.map_error (fun m -> Local m) (Json.decode_json codec json)
 
 (* Cacheable lists: every page, following cursors until exhausted (a cursor
    seen twice is a server bug, not a reason to loop), cached for the
@@ -337,8 +460,12 @@ let listen t (filter : Proto.Filter.t) f =
         | _ -> ());
         f method_ (Option.value (Json.find "params" note) ~default:Json.empty)
   in
-  let notifications = Result.get_ok (Jsont.Json.encode Proto.Filter.codec filter) in
-  Result.map ignore (send t ~on_note "subscriptions/listen" [ ("notifications", notifications) ])
+  let notifications = encode Proto.Filter.codec filter in
+  match protocol_version t with
+  | Ok v when is_legacy v -> Error (Local ("subscriptions/listen needs revision " ^ Proto.version))
+  | _ ->
+      Result.map ignore
+        (send t ~on_note "subscriptions/listen" [ ("notifications", notifications) ])
 
 (* What a transport's reader hands to the fiber waiting on a request: its
    notifications, for that fiber to run as callbacks, then its response. The
@@ -426,6 +553,7 @@ let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26)
      in flight, and a bound could hold up the protected cancellation. *)
   let out = Eio.Stream.create max_int in
   let unsolicited = Inbox.create ~max_queued ~overflow:`Drop in
+  let on_request = ref ignore in
   let close message =
     if !closed = None then (
       closed := Some message;
@@ -464,6 +592,11 @@ let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26)
         | Ok (None, Some _, Some id) when Hashtbl.mem pending id ->
             Inbox.note (Hashtbl.find pending id) line
         | Ok (None, Some _, _) -> Inbox.note unsolicited line
+        | Ok (Some _, Some _, _) ->
+            (* A request of the server's own, answered on a fiber of its own
+               so the reader never waits for it. *)
+            Eio.Fiber.fork ~sw (fun () ->
+                try !on_request line with Eio.Cancel.Cancelled _ as e -> raise e | _ -> ())
         | _ -> ());
         loop ()
       in
@@ -494,4 +627,8 @@ let line_transport ~sw ?(on_notification = ignore) ?(max_message = 1 lsl 26)
                ^ Id.to_wire id ^ "}}")));
         raise e
   in
-  { send }
+  let post ~headers:_ body =
+    Option.iter failwith !closed;
+    Eio.Stream.add out body
+  in
+  { send; post; requests = (fun f -> on_request := f) }

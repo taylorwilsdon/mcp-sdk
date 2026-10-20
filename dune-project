@@ -17,7 +17,7 @@
  (name mcp-sdk)
  (synopsis "Model Context Protocol (2026-07-28) SDK for OCaml 5")
  (description
-  "A stateless, multicore Model Context Protocol server and client for OCaml 5 built on Eio. Targets protocol revision 2026-07-28 with multi round-trip requests, subscriptions, cacheable results, stdio and HTTP/1.1 transports.")
+  "A stateless, domain-safe Model Context Protocol server and client for OCaml 5 built on Eio. Targets protocol revision 2026-07-28 with multi round-trip requests, subscriptions, cacheable results, stdio and HTTP/1.1 transports, and serves and reaches peers of revisions 2025-11-25 and 2025-06-18.")
  (depends
   (ocaml
    (>= 5.2))

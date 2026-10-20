@@ -614,6 +614,8 @@ let first_text (r : Proto.Call_result.t) =
   match r.content with Proto.Content.Text t :: _ -> t.text | _ -> ""
 
 let client_suite ~clock server client =
+  let legacy = ok (Client.protocol_version client) <> Proto.version in
+  if not legacy then ignore (ok (Client.discover client));
   let call name args = ok (Client.call_tool client name (parse args)) in
   Alcotest.(check string) "echo" "hi" (first_text (call "echo" {|{"message":"hi"}|}));
   Alcotest.(check string) "mrtr" "confirmed x" (first_text (call "confirm" {|{"what":"x"}|}));
@@ -652,36 +654,42 @@ let client_suite ~clock server client =
   in
   wait 40;
   Alcotest.(check int) "handler cancelled" (before + 1) (Atomic.get slow_cancelled);
-  (* Subscriptions. *)
-  let seen = ref [] in
-  let filter = { Proto.Filter.none with tools = true; uris = [ "mem://a" ] } in
-  Eio.Fiber.both
-    (fun () -> ok (Client.listen client filter (fun m _ -> seen := m :: !seen)))
-    (fun () ->
-      let rec until_acked n =
-        if !seen = [] && n > 0 then (
-          Eio.Time.sleep clock 0.02;
-          until_acked (n - 1))
-      in
-      until_acked 100;
-      Server.add_tool server (any_tool "late");
-      Server.resource_updated server "mem://a";
-      Server.resource_updated server "mem://other";
-      Eio.Time.sleep clock 0.1;
-      Server.shutdown server);
-  Alcotest.(check (list string))
-    "notifications"
-    [
-      "notifications/subscriptions/acknowledged";
-      "notifications/tools/list_changed";
-      "notifications/resources/updated";
-    ]
-    (List.rev !seen);
-  Alcotest.(check int) "cache invalidated" 6 (List.length (ok (Client.list_tools client)))
+  (* Subscriptions, which earlier revisions only offer outside a request. *)
+  if legacy then (
+    (match Client.listen client Proto.Filter.none (fun _ _ -> ()) with
+    | Error (Client.Local _) -> ()
+    | _ -> Alcotest.fail "expected listen to be refused");
+    Alcotest.(check int) "tools unchanged" 5 (List.length (ok (Client.list_tools client))))
+  else
+    let seen = ref [] in
+    let filter = { Proto.Filter.none with tools = true; uris = [ "mem://a" ] } in
+    Eio.Fiber.both
+      (fun () -> ok (Client.listen client filter (fun m _ -> seen := m :: !seen)))
+      (fun () ->
+        let rec until_acked n =
+          if !seen = [] && n > 0 then (
+            Eio.Time.sleep clock 0.02;
+            until_acked (n - 1))
+        in
+        until_acked 100;
+        Server.add_tool server (any_tool "late");
+        Server.resource_updated server "mem://a";
+        Server.resource_updated server "mem://other";
+        Eio.Time.sleep clock 0.1;
+        Server.shutdown server);
+    Alcotest.(check (list string))
+      "notifications"
+      [
+        "notifications/subscriptions/acknowledged";
+        "notifications/tools/list_changed";
+        "notifications/resources/updated";
+      ]
+      (List.rev !seen);
+    Alcotest.(check int) "cache invalidated" 6 (List.length (ok (Client.list_tools client)))
 
 let with_env f () = Eio_main.run @@ fun env -> f env
 
-let stdio_test =
+let stdio_test protocol =
   with_env @@ fun env ->
   let clock = Eio.Stdenv.clock env in
   Eio.Switch.run @@ fun sw ->
@@ -693,7 +701,27 @@ let stdio_test =
       Eio.Resource.close s2c_w)
     (fun () ->
       let transport = Client.line_transport ~sw s2c_r c2s_w in
-      client_suite ~clock server (Client.connect ~capabilities:caps ~on_input transport);
+      client_suite ~clock server (Client.connect ~capabilities:caps ~on_input ~protocol transport);
+      Eio.Resource.close c2s_w)
+
+(* A client of an earlier revision that cannot answer gives the server an
+   error response, which fails the request instead of leaving it waiting. *)
+let declined_input =
+  with_env @@ fun env ->
+  let clock = Eio.Stdenv.clock env in
+  Eio.Switch.run @@ fun sw ->
+  let c2s_r, c2s_w = Eio_unix.pipe sw and s2c_r, s2c_w = Eio_unix.pipe sw in
+  Eio.Fiber.both
+    (fun () ->
+      Stdio.serve (e2e_server clock) c2s_r s2c_w;
+      Eio.Resource.close s2c_w)
+    (fun () ->
+      let client =
+        Client.connect ~capabilities:caps ~protocol:`Legacy (Client.line_transport ~sw s2c_r c2s_w)
+      in
+      (match Client.call_tool client "confirm" (parse {|{"what":"x"}|}) with
+      | Error (Client.Remote e) -> Alcotest.(check int) "internal error" (-32603) e.code
+      | _ -> Alcotest.fail "expected the declined request to fail");
       Eio.Resource.close c2s_w)
 
 let port =
@@ -701,7 +729,7 @@ let port =
     (Random.self_init ();
      20000 + Random.int 20000)
 
-let http_test =
+let http_test protocol =
   with_env @@ fun env ->
   let clock = Eio.Stdenv.clock env and net = Eio.Stdenv.net env in
   let server = e2e_server clock in
@@ -715,8 +743,7 @@ let http_test =
         Eio.Switch.run @@ fun sw ->
         Eio.Time.sleep clock 0.05;
         let transport = Mcp_http.Client.http1 ~sw ~net ~port () in
-        let client = Client.connect ~capabilities:caps ~on_input transport in
-        ignore (ok (Client.discover client));
+        let client = Client.connect ~capabilities:caps ~on_input ~protocol transport in
         client_suite ~clock server client;
         Eio.Switch.fail sw Exit
       with Exit -> ())
@@ -784,6 +811,100 @@ let last_event stream =
     (fun last l ->
       if String.starts_with ~prefix:"data: " l then String.sub l 6 (String.length l - 6) else last)
     "" events
+
+(* Structured results in each revision's form. *)
+let shaped_server () =
+  let numbers =
+    Tool.output ~schema:(parse {|{"type":"array","items":{"type":"integer"}}|}) Jsont.(list int)
+  in
+  let point = Tool.output ~schema:(parse {|{"type":"object"}|}) Jsont.json in
+  let link =
+    Tool.v "link" Schema.empty (fun ctx () ->
+        match Ctx.input ctx "go" with
+        | Some _ -> Ok (Tool.text "visited")
+        | None ->
+            Ok
+              (Input.required
+                 [ ("go", Input.elicit_url ~message:"Sign in" ~url:"https://example.com/login") ]))
+  in
+  Server.v ~name:"shaped" ~version:"1"
+    ~tools:
+      [
+        Tool.v "numbers" ~output:numbers Schema.empty (fun _ () ->
+            Ok (Tool.return numbers [ 1; 2 ]));
+        Tool.v "point" ~output:point Schema.empty (fun _ () ->
+            Ok (Tool.structured (parse {|{"x":1}|})));
+        Tool.v "untyped" Schema.empty (fun _ () -> Ok (Tool.structured (Json.str "plain")));
+        link;
+      ]
+    ()
+
+let legacy_session ?(caps = "{}") server version =
+  match Server.decode server (initialize ~caps version) with
+  | Server.Request r -> Server.Request.session r
+  | _ -> Alcotest.fail "initialize was not decoded"
+
+let legacy_call name =
+  Printf.sprintf {|{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s"}}|} name
+
+let structured_json r = Json.to_string (Option.get (get [ "result"; "structuredContent" ] r))
+
+let output_schema name r =
+  match get [ "result"; "tools" ] r with
+  | Some (Jsont.Array (tools, _)) ->
+      List.find (fun t -> str (Json.find "name" t) = name) tools
+      |> Json.find "outputSchema" |> Option.get |> Json.to_string
+  | _ -> Alcotest.fail "expected tools"
+
+let shaped_tests =
+  [
+    Alcotest.test_case "typed output" `Quick (fun () ->
+        let s = shaped_server () in
+        let r = call s (req "tools/call" {|,"name":"numbers"|}) in
+        Alcotest.(check string) "structured" "[1,2]" (structured_json r);
+        Alcotest.(check string) "default content" "[1,2]" (text_of r);
+        Alcotest.(check string)
+          "schema" {|{"type":"array","items":{"type":"integer"}}|}
+          (output_schema "numbers" (call s (req "tools/list" ""))));
+    Alcotest.test_case "earlier revisions get objects" `Quick (fun () ->
+        let s = shaped_server () in
+        let session = legacy_session s "2025-11-25" in
+        let legacy name = structured_json (call ?session s (legacy_call name)) in
+        Alcotest.(check string) "typed array" {|{"result":[1,2]}|} (legacy "numbers");
+        Alcotest.(check string) "object" {|{"x":1}|} (legacy "point");
+        Alcotest.(check string) "untyped scalar" {|{"result":"plain"}|} (legacy "untyped");
+        Alcotest.(check string)
+          "modern scalar" {|"plain"|}
+          (structured_json (call s (req "tools/call" {|,"name":"untyped"|})));
+        let tools = call ?session s {|{"jsonrpc":"2.0","id":1,"method":"tools/list"}|} in
+        Alcotest.(check string)
+          "wrapped schema"
+          {|{"type":"object","properties":{"result":{"type":"array","items":{"type":"integer"}}},"required":["result"]}|}
+          (output_schema "numbers" tools);
+        Alcotest.(check string) "object schema" {|{"type":"object"}|} (output_schema "point" tools));
+    Alcotest.test_case "URL elicitation of earlier revisions" `Quick
+      ( with_env @@ fun env ->
+        let s = shaped_server () in
+        let post = post ~clock:(Eio.Stdenv.clock env) s in
+        let _, session, _ = post (initialize ~caps:{|{"elicitation":{"url":{}}}|} "2025-11-25") in
+        let asked = ref None in
+        let on_flush stream =
+          let ask = last_event stream in
+          if !asked = None && get [ "method" ] ask <> None then (
+            asked := Some ask;
+            ignore (post ?session (accept (get [ "id" ] ask))))
+        in
+        let _, _, stream = post ?session ~on_flush (legacy_call "link") in
+        let ask = Option.get !asked in
+        Alcotest.(check string) "mode" "url" (str (get [ "params"; "mode" ] ask));
+        Alcotest.(check string)
+          "elicitationId is the request id"
+          (str (get [ "id" ] ask))
+          (str (get [ "params"; "elicitationId" ] ask));
+        Alcotest.(check string) "answer" "visited" (text_of (last_event stream));
+        let session = legacy_session ~caps:{|{"elicitation":{}}|} s "2025-06-18" in
+        check_code (-32021) (call ?session s (legacy_call "link")) );
+  ]
 
 let legacy_tests =
   let s = make_server () in
@@ -929,11 +1050,16 @@ let () =
       ("server", server_tests);
       ("mrtr", mrtr_tests);
       ("legacy", legacy_tests);
+      ("structured results", shaped_tests);
       ("robustness", robustness_tests);
       ("regressions", Regression.tests);
       ( "e2e",
         [
-          Alcotest.test_case "stdio" `Quick stdio_test;
-          Alcotest.test_case "http/1.1" `Quick http_test;
+          Alcotest.test_case "stdio" `Quick (stdio_test `Modern);
+          Alcotest.test_case "http/1.1" `Quick (http_test `Modern);
+          Alcotest.test_case "stdio, 2025-11-25" `Quick (stdio_test `Legacy);
+          Alcotest.test_case "http/1.1, 2025-11-25" `Quick (http_test `Legacy);
+          Alcotest.test_case "http/1.1, negotiated" `Quick (http_test `Auto);
+          Alcotest.test_case "declined input, 2025-11-25" `Quick declined_input;
         ] );
     ]

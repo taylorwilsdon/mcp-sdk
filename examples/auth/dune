@@ -1,0 +1,14 @@
+(library
+ (name auth_example)
+ (modules bearer app)
+ (libraries mcp mcp_http eio httpun httpun-eio gluten digestif base64 unix))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries auth_example eio_main))
+
+(test
+ (name test_auth)
+ (modules test_auth)
+ (libraries auth_example mcp mcp_http alcotest eio_main))

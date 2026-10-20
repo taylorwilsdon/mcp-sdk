@@ -186,9 +186,20 @@ let execute cfg server ~scope x ~headers ?principal req =
     (fun () -> Eio.Promise.await gone);
   Option.iter (fun w -> if Eio.Promise.is_resolved gone then w.close ()) !sse
 
+(* A body version the [MCP-Protocol-Version] header does not repeat is a
+   header mismatch, whether or not the server supports either. *)
+let version_mismatch x (e : Error.t) =
+  match (Option.bind e.data (Json.find "requested"), x.header "mcp-protocol-version") with
+  | Some (Jsont.String (requested, _)), Some header
+    when e.code = Error.unsupported_version_code && requested <> header ->
+      Error.header_mismatch
+        (Printf.sprintf "mcp-protocol-version header value %S does not match body value %S" header
+           requested)
+  | _ -> e
+
 let dispatch cfg server ~scope x ?principal ?session body =
   match Server.decode server ?session body with
-  | Server.Reject (id, e) -> reply x ?id e
+  | Server.Reject (id, e) -> reply x ?id (version_mismatch x e)
   | Ignore | Cancel _ -> x.respond ~status:202 [] []
   | Request req -> (
       (* Earlier revisions mirror nothing into headers. *)
